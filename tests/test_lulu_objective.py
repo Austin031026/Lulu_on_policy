@@ -167,6 +167,23 @@ def test_large_logits_are_stable_and_half_inputs_use_float32_math():
     assert torch.isfinite(loss) and torch.isfinite(c.grad).all()
 
 
+def test_pointwise_kl_clip_caps_vocab_contributions_before_sum():
+    target = torch.tensor([[0.8, 0.2]], dtype=torch.float64)
+    student = torch.tensor([[0.01, 0.99]], dtype=torch.float64).log().requires_grad_()
+    unclipped_terms = target * (target.log() - student.log_softmax(-1))
+    expected = unclipped_terms.clamp(max=0.05).sum(-1).mean()
+    actual = forward_kl(student, target, pointwise_clip=0.05)
+    torch.testing.assert_close(actual, expected)
+    assert actual < unclipped_terms.sum()
+
+
+@pytest.mark.parametrize("value", [0, -0.1, True])
+def test_invalid_pointwise_kl_clip_is_rejected(value):
+    target = torch.tensor([[0.5, 0.5]])
+    with pytest.raises(ValueError, match="pointwise_clip"):
+        forward_kl(target.log(), target, pointwise_clip=value)
+
+
 @pytest.mark.parametrize("k", [0, -1, True, 1.5])
 def test_invalid_topk_fails_clearly(k):
     c, h, t = _probabilities()

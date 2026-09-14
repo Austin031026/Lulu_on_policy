@@ -262,10 +262,15 @@ def forward_kl(
     *,
     reduction: str = "sequence_mean",
     sequence_ids: torch.Tensor | None = None,
+    pointwise_clip: float | None = None,
 ) -> torch.Tensor:
     """Compute KL(stopgrad(target) || student), differentiating only the student.
 
     ``target_probs`` must already be a normalized probability distribution.
+    When ``pointwise_clip`` is set, each vocabulary-level KL contribution is
+    capped before summing over the vocabulary, matching OPSD's pointwise
+    clipping. Because individual KL contributions can be negative, the clipped
+    vocabulary sum is not guaranteed to remain nonnegative.
     The reduction follows the per-sequence reasoning-position mean in ReN's
     objective. Use ``reduction='none'`` when accumulating projected chunks with
     sequence weights outside this function. Zero target entries are supported.
@@ -276,9 +281,14 @@ def forward_kl(
         raise ValueError("student_logits and target_probs must be on the same device")
     if not student_logits.is_floating_point() or not target_probs.is_floating_point():
         raise ValueError("student_logits and target_probs must be floating-point tensors")
+    if pointwise_clip is not None and (isinstance(pointwise_clip, bool) or pointwise_clip <= 0):
+        raise ValueError("pointwise_clip must be a positive number or None")
     dtype = _math_dtype(student_logits, target_probs)
     target = target_probs.detach().to(dtype)
     log_student = F.log_softmax(student_logits.to(dtype), dim=-1)
     # xlogy defines the 0*log(0) limit without introducing epsilon mass.
-    position_kl = (torch.xlogy(target, target) - target * log_student).sum(-1)
+    contributions = torch.xlogy(target, target) - target * log_student
+    if pointwise_clip is not None:
+        contributions = contributions.clamp(max=pointwise_clip)
+    position_kl = contributions.sum(-1)
     return reduce_position_losses(position_kl, mask, reduction=reduction, sequence_ids=sequence_ids)

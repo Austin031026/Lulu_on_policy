@@ -15,6 +15,7 @@ Rona_LuLu/
 - `scripts/prepare_lulu_data.py`：DAPO／自定义数据准备。
 - `scripts/train_lulu.py` 或 `runs/train_lulu.sh`：多轮 on-policy 蒸馏。
 - `scripts/evaluate_lulu.py` 或 `runs/eval_lulu.sh`：base／多个 checkpoint 的通用评测。
+- `runs/eval_lulu_checkpoints.sh`：一次评测 base 与同一 run 的多个保留 step。
 - `lulu/objective.py`：可独立复用的 target 和 forward KL。
 
 ## 算法与边界
@@ -28,7 +29,7 @@ qT = external Teacher(causal prompt + sampled response prefix)
 R  = TopK(pH) minus TopK(pC)
 q_hat[a] = qT[a]  if a in R and qT[a] > pC[a], else pC[a]
 target = q_hat / sum(q_hat)
-loss = KL(stop_gradient(target) || trainable Student)
+loss = sum_v min(KL_contribution_v(stop_gradient(target) || trainable Student), tau=0.05)
 ```
 
 Gold outcome 只加在 hindsight user context 中，不使用 gold solution，也不进入 Student rollout、Teacher context 或 trainable Student context。缓存保留 sampled token IDs，不将轨迹重新 tokenize；预测 response token t 的 hidden index 是 `prompt_length + t - 1`。
@@ -37,19 +38,21 @@ ReN 只启用明确的 `<think>...</think>` reasoning span，支持 token 上限
 
 每条有 reasoning 的轨迹先对 reasoning positions 取平均，再对全局有效轨迹取平均。没有 positive correction 的 position **仍保留**，target 等于 frozen pC：更新起点 KL/gradient 为零；Student 更新后，该位置可以产生回到 snapshot 的约束。它不是永远零梯度，也不是按 novelty score 加权或筛选轨迹。
 
+默认 `--pointwise-kl-clip 0.05`：在对词表求和前，将每个 vocabulary entry 的 forward-KL contribution 上限裁剪为 0.05，与 OPSD Thinking 配置的默认值一致；设为 0 可关闭以做消融。这不是整个位点 KL clipping，也不是更新前后 Student 的 trust-region 约束。
+
 默认每轮一整个 rollout batch、一次全局 optimizer update，然后刷新快照和 rollout。常驻后端只接受 `--update-passes 1`：本轮全部轨迹和 target 准备完成后才进入 DDP update，下一轮必须等待更新与 hindsight 权重同步完成。优化器状态跨 round 常驻；断点续训从完整 checkpoint 恢复，未完成 round 重新采样、评分。旧的 `--backend staged` 仍支持多次 update-passes，但后续更新使用的是本轮旧快照采样的轨迹。
 
 ## 并行与显存
 
-默认 `--backend persistent` 将模型和 optimizer 常驻于固定 GPU 组。当前机器是 8 × A100-SXM4-80GB；默认 ReN 配置分工如下：
+默认 `--backend persistent` 将模型和 optimizer 常驻于固定 GPU 组。当前机器是 8 × A100-SXM4-80GB，但物理 GPU 3 已标记为故障，当前 ReN 配置分工如下：
 
 | GPU | 常驻角色 | 并行方式 |
 | --- | --- | --- |
-| 0–4 | Qwen3-1.7B Student | 每卡一份完整 Student；rollout 数据并行，update 使用 5 卡 DDP |
+| 0、1、2、4 | Qwen3-1.7B Student | 每卡一份完整 Student；rollout 数据并行，update 使用 4 卡 DDP |
 | 5 | privileged / hindsight Student | 同一个 Student 的独立推理副本，每轮开始同步最新可训练参数 |
 | 6–7 | 单个 Qwen3-32B Teacher | Transformers 原生 `tp_plan="auto"`，同一实例做 2 卡 tensor parallel |
 
-这不是 5 卡分片加载一个 1.7B Student；5 份 Student 同时处理不同题目。Privileged 模型也不是额外的固定 Teacher，而是当前 Student 的 gold-conditioned view。LoRA 训练只同步 adapter 参数；全参数训练需要同步全部可训练权重，内存、通信和保存开销都会增加。Teacher 始终只看到 causal prompt 和 Student sampled prefix，不接收 gold 或 hindsight prompt。
+这不是 4 卡分片加载一个 1.7B Student；4 份 Student 同时处理不同题目。Privileged 模型也不是额外的固定 Teacher，而是当前 Student 的 gold-conditioned view。LoRA 训练只同步 adapter 参数；全参数训练需要同步全部可训练权重，内存、通信和保存开销都会增加。Teacher 始终只看到 causal prompt 和 Student sampled prefix，不接收 gold 或 hindsight prompt。
 
 同一轮内，Student 按 batch 流式提交已采样轨迹；hindsight 为较早的 batch 计算 recognition frontier 时，其他 Student batch 可以继续采样，Teacher 随后为已完成 frontier 的 batch 评分。全部 batch 完成后进行一次 DDP update。**流水线只在同一份冻结快照的 round 内重叠，不提前用旧权重采样下一轮。**
 
@@ -57,7 +60,7 @@ Frozen hidden states 留在各 Student 进程内存中，稀疏 Teacher probabil
 
 `--student-gpus`、`--hindsight-gpus`、`--teacher-gpus` 可显式分配互不重叠的组；不指定时从 `--gpus` 中自动分配，默认保留 2 卡给 Teacher、1 卡给 hindsight，其余给 Student。`--teacher-gpus-per-worker` 控制自动分配的 Teacher TP 大小，显式 `--teacher-gpus` 则直接决定 TP 大小；常驻后端只有一个 Teacher 实例。`opsd` 不启动 Teacher，`vanilla_opd` / `causal_topk` 不启动 hindsight，未使用角色应保持 GPU 参数为 `auto`。
 
-5+1+2 是起始配置，实际吞吐取决于 rollout 长度和两个评分服务的速度。针对默认 8192-token response 上限，每个 Student 默认 `--rollout-batch-size 4`，Teacher/hindsight 评分默认 `--score-batch-size 1`，反向默认 `--train-micro-batch-size 1`。评分 batch1 限制长上下文 padding 带来的激活显存开销；全局 batch 仍是 64 道题，由各 Student 分批处理并累积成一次更新。生成目前仍是静态 batch 的 HF `generate`，没有 continuous batching。Teacher TP 要求所选模型提供兼容的原生 TP plan；不能把任意模型的层分片当成 TP。
+4+1+2 是当前起始配置，实际吞吐取决于 rollout 长度和两个评分服务的速度。针对默认 8192-token response 上限，每个 Student 默认 `--rollout-batch-size 4`，Teacher/hindsight 评分默认 `--score-batch-size 1`，反向默认 `--train-micro-batch-size 1`。评分 batch1 限制长上下文 padding 带来的激活显存开销；全局 batch 仍是 64 道题，4 个 Student rank 各处理 16 道题并累积成一次更新。生成目前仍是静态 batch 的 HF `generate`，没有 continuous batching。Teacher TP 要求所选模型提供兼容的原生 TP plan；不能把任意模型的层分片当成 TP。
 
 当前 Torch 2.7 / Transformers 4.52.4 下，Teacher TP 的 rowwise 输出归约显式同步完成；矩阵仍按原生 TP plan 分片。此前较大 GPU batch 出现过 collective 超时，已应用该规避方案，并通过 CPU 双进程 8192-token 投影对照检查；该修复尚未重做大型 GPU 验证。
 
@@ -100,13 +103,43 @@ export OMP_NUM_THREADS=1
   --train-data ../Soraka_rlrl/data/lulu_dapo/train.jsonl \
   --output-dir ../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b \
   --model Qwen/Qwen3-1.7B --teacher-model Qwen/Qwen3-32B \
-  --backend persistent --gpus 0,1,2,3,4,5,6,7 \
-  --student-gpus 0,1,2,3,4 --hindsight-gpus 5 --teacher-gpus 6,7 \
+  --backend persistent --gpus 0,1,2,4,5,6,7 \
+  --student-gpus 0,1,2,4 --hindsight-gpus 5 --teacher-gpus 6,7 \
   --global-batch-prompts 64 --rollout-batch-size 4 --score-batch-size 1 \
   --train-micro-batch-size 1 --logit-chunk-size 32 \
+  --pointwise-kl-clip 0.05 \
   --rounds 100 --max-new-tokens 8192 \
   --max-prompt-tokens 4096 --max-sequence-tokens 16384 \
   --top-k 32 --save-every 20 --dry-run
+```
+
+也可以直接使用固定排除 GPU 3 的入口；后续参数会原样传给通用训练脚本：
+
+```bash
+runs/train_lulu_7gpu.sh \
+  --train-data ../Soraka_rlrl/data/lulu_dapo/train.jsonl \
+  --output-dir ../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b
+```
+
+在提高并行数前，用正式模型和最长上下文做独立峰值测试：
+
+```bash
+"$PYTHON_BIN" scripts/profile_lulu_batches.py \
+  --student-gpu 0 --hindsight-gpu 5 --teacher-gpus 6,7 \
+  --rollout-batches 1,2,4,8,12,16 \
+  --score-batches 1,2,4,6,8,12,16 \
+  --output ../LuLu_outputs/lulu_batch_profile.json
+```
+
+测试固定使用 4096-token prompt、8192-token response，并把全部 response token 作为评分位置；每个候选 batch 在新进程中运行，OOM 后不会污染下一个测试。报告按 80 GiB 的 90% 作为安全线。当前 global batch 64、4 个 Student rank、每题 1 条 rollout，所以每卡每轮只有 16 条轨迹，`rollout_batch_size` 超过 16 没有吞吐收益。`--score-batch-size` 同时用于 Student causal scoring、privileged Student scoring 和 Teacher scoring，因此正式训练取三项安全上限的最小值，并且不会高于 rollout batch。32B Teacher 的 batch 是 GPU 6–7 上单个 TP 实例的全局 batch，不是每张卡各自处理一批。
+
+压测完成后，7-GPU 入口可以直接读取报告中的两个推荐 batch：
+
+```bash
+LULU_BATCH_PROFILE=../LuLu_outputs/lulu_batch_profile.json \
+  runs/train_lulu_7gpu.sh \
+  --train-data ../Soraka_rlrl/data/lulu_dapo/train.jsonl \
+  --output-dir ../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b
 ```
 
 去掉 `--dry-run` 开始训练；同命令加 `--resume` 恢复。恢复要求模型、训练配置和 train.jsonl 的 SHA256 一致；输入/输出路径的写法以及保存间隔可调整，原始 run_config.json 不会被重写。常驻后端从原子发布的 `checkpoints/latest` 恢复完整 Student 和 optimizer；历史 staged 实验应显式使用 `--backend staged` 续训，不能直接切换后端复用其运行目录。
@@ -151,7 +184,7 @@ export LULU_SORAKA_ROOT=../Soraka/Global_reasoning
 export DATA_MANIFEST=../Soraka_rlrl/experiments/v6_5-success-q-scale-pool4096-phase11024-seed42/crossbench_v631/data/manifest.json
 export CHECKPOINT=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest
 export OUTPUT_DIR=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/evaluation
-PYTHON="$PYTHON_BIN" GPUS=0,1,2,3,4,5,6,7 BATCH_SIZE=8 bash runs/eval_lulu.sh
+PYTHON="$PYTHON_BIN" GPUS=0,1,2,4,5,6,7 BATCH_SIZE=8 bash runs/eval_lulu.sh
 ```
 
 评测只运行部署时的 Student，无 Teacher/hindsight/gold prompt。Checkpoint 是普通 HF／PEFT 文件，可以被现有工具继续加载。
@@ -163,7 +196,7 @@ DAPO held-out dev 也可直接评测：
   --checkpoint ren=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest \
   --benchmark dapo_dev=../Soraka_rlrl/data/lulu_dapo/dev_eval.parquet \
   --output-dir ../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/dapo_dev_eval \
-  --gpus 0,1,2,3,4,5,6,7 --batch-size 8
+  --gpus 0,1,2,4,5,6,7 --batch-size 8
 ```
 
 

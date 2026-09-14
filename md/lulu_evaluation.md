@@ -11,7 +11,7 @@ export PYTHON=/pfss/mlde/workspaces/mlde_wsp_Eco_Inference/envs/trl/bin/python
 export LULU_SORAKA_ROOT=../Soraka/Global_reasoning
 export DATA_MANIFEST="$(realpath ../Soraka_rlrl/experiments/v6_5-success-q-scale-pool4096-phase11024-seed42/crossbench_v631/data/manifest.json)"
 
-CHECKPOINT=/path/to/lulu-run/checkpoints/round_0100 \
+CHECKPOINT=/path/to/lulu-run/checkpoints/step_000100 \
 OUTPUT_DIR=/path/to/new-evaluation-dir \
 GPUS=0,1,2,3,4,5,6,7 BATCH_SIZE=8 \
 bash runs/eval_lulu.sh
@@ -19,7 +19,7 @@ bash runs/eval_lulu.sh
 
 通用评测依赖显式指向 `LULU_SORAKA_ROOT`，对应 Python 参数 `--soraka-root`；默认从 LuLu 目录的位置解析相邻 `../Soraka/Global_reasoning`。框架代码包括 `scripts/evaluate_plain_model.py`、`scripts/benchmark_parser.py`，以及可选的 LiveCodeBench 工具；LuLu 不复制这些实现。launcher 不加载 Soraka defaults，不改变当前目录，所以相对 `CHECKPOINT`、`DATA_MANIFEST` 和 `OUTPUT_DIR` 均相对调用时的工作目录。新评测默认输出到 `../LuLu_outputs` 下；已有 benchmark manifest 和历史 checkpoint 继续使用原位置。
 
-`round_0000` 是初始化 checkpoint；`round_0001` 是第一轮更新后的 Student。`CHECKPOINT` 指向含 `adapter_config.json` 和 tokenizer 的 round 目录，也支持完整 HF 模型目录。无需合并 adapter。`MODEL` 默认是 `Qwen/Qwen3-1.7B`，更换 Student 时一并设置，用于 base 对照。迁移 adapter 后若内部 base 路径失效，可追加 `--adapter-base-model /new/base/path`。
+Persistent 后端中，`step_000000` 是初始化 checkpoint，`step_000001` 是第一次 optimizer update 后的 Student；旧 staged 后端使用 `round_XXXX` 命名。`CHECKPOINT` 指向含 `adapter_config.json` 和 tokenizer 的 checkpoint 目录，也支持完整 HF 模型目录。无需合并 adapter。`MODEL` 默认是 `Qwen/Qwen3-1.7B`，更换 Student 时一并设置，用于 base 对照。迁移 adapter 后若内部 base 路径失效，可追加 `--adapter-base-model /new/base/path`。
 
 默认同时评测 base 和指定 checkpoint。上述现有 manifest 的 `full` 包含：
 
@@ -44,7 +44,7 @@ bash runs/eval_lulu.sh
 DRY_RUN=1 GPUS=0,1,2,3 bash runs/eval_lulu.sh
 
 # 快速检查：只用 general reasoning 的 probe split。
-CHECKPOINT=/path/to/lulu-run/checkpoints/round_0001 \
+CHECKPOINT=/path/to/lulu-run/checkpoints/step_000001 \
 OUTPUT_DIR=/path/to/new-probe-dir \
 BENCHMARKS=mmlu_pro,gpqa_diamond SPLIT=probe \
 MAX_EXAMPLES=16 MAX_RESPONSE_TOKENS=1024 \
@@ -57,13 +57,25 @@ GPUS=0,1 BATCH_SIZE=8 bash runs/eval_lulu.sh
 
 ## 多方法与自定义数据
 
+同一训练 run 的多个保留节点可以一次评测。下面默认加载 base、step 20/40/60/80/100，并评测 AIME25 和 OlympiadBench：
+
+```bash
+TRAIN_OUTPUT_DIR=/path/to/lulu-run \
+DATA_MANIFEST=/path/to/crossbench/manifest.json \
+OUTPUT_DIR=/path/to/new-checkpoint-evaluation \
+GPUS=0,1,2,3,4,5,6,7 \
+bash runs/eval_lulu_checkpoints.sh
+```
+
+用 `STEPS=20,40,60` 或 `BENCHMARKS=aime25,olympiadbench,math500` 调整节点和数据集。脚本在启动 GPU worker 前检查所有指定的 `step_XXXXXX` 目录；缺失节点会直接报错。评测默认保持 Thinking Mode。
+
 ```bash
 "$PYTHON" scripts/evaluate_lulu.py \
   --soraka-root "$LULU_SORAKA_ROOT" \
   --model Qwen/Qwen3-1.7B --include-base \
-  --checkpoint ren=/path/ren/checkpoints/round_0100 \
-  --checkpoint opd=/path/vanilla-opd/checkpoints/round_0100 \
-  --checkpoint opsd=/path/opsd/checkpoints/round_0100 \
+  --checkpoint ren=/path/ren/checkpoints/step_000100 \
+  --checkpoint opd=/path/vanilla-opd/checkpoints/step_000100 \
+  --checkpoint opsd=/path/opsd/checkpoints/step_000100 \
   --data-manifest "$DATA_MANIFEST" \
   --output-dir /path/to/new-comparison-dir \
   --gpus 0,1,2,3,4,5,6,7 --batch-size 8

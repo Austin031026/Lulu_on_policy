@@ -67,6 +67,8 @@ def parser():
     p.add_argument('--learning-rate', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=0.0)
     p.add_argument('--max-grad-norm', type=float, default=1.0)
+    p.add_argument('--pointwise-kl-clip', type=float, default=0.05,
+                   help='Cap each vocabulary-level forward-KL contribution before summing; 0 disables')
     p.add_argument('--lora-rank', type=int, default=16, help='0 for full parameter training')
     p.add_argument('--lora-alpha', type=int, default=32)
     p.add_argument('--lora-target-modules', default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
@@ -97,6 +99,8 @@ def validate_args(a):
         raise ValueError('Require temperature > 0 and 0 < top_p <= 1')
     if a.lora_rank < 0 or a.teacher_workers < 0 or a.learning_rate <= 0:
         raise ValueError('Invalid LoRA rank, teacher worker count or learning rate')
+    if a.pointwise_kl_clip < 0:
+        raise ValueError('pointwise_kl_clip must be nonnegative; 0 disables clipping')
     unsupported_heads = {'lm_head', 'embed_tokens', 'embed_in', 'embed_out', 'wte',
                          'word_embeddings', 'tok_embeddings', 'embeddings'}
     targets = {name.strip().rsplit('.', 1)[-1] for name in a.lora_target_modules.split(',')}
@@ -480,7 +484,9 @@ class DistillationStep(nn.Module):
                                 target = logits.float().softmax(-1)
                             else:
                                 target = build_cached_target(logits, ids, probs, method=a.method)
-                    return forward_kl(head(live), target, reduction='none').sum()
+                    clip = getattr(a, 'pointwise_kl_clip', None) or None
+                    return forward_kl(head(live), target, reduction='none',
+                                      pointwise_clip=clip).sum()
 
                 value = checkpoint(chunk_loss, hs[start:end], frozen, ids, probs, th,
                                    use_reentrant=False) if a.gradient_checkpointing else chunk_loss(hs[start:end], frozen, ids, probs, th)

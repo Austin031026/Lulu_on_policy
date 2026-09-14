@@ -11,7 +11,7 @@ export MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
 [[ -z "${S2T_PARSER:-}" ]] || export S2T_MATH_PARSER="${S2T_MATH_PARSER:-$S2T_PARSER}"
 args=(--model "$MODEL" --soraka-root "$SORAKA_ROOT"
       --output-dir "${OUTPUT_DIR:-${LULU_OUTPUT_ROOT:-$WORKSPACE_ROOT/LuLu_outputs}/evaluation}"
-      --gpus "${GPUS:-auto}" --batch-size "${BATCH_SIZE:-8}"
+      --gpus "${GPUS:-0,1,2,4,5,6,7}" --batch-size "${BATCH_SIZE:-8}"
       --max-response-tokens "${MAX_RESPONSE_TOKENS:-8192}"
       --max-prompt-tokens "${MAX_PROMPT_TOKENS:-4096}"
       --max-examples "${MAX_EXAMPLES:-0}" --split "${SPLIT:-full}")
