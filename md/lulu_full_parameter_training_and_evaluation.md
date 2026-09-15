@@ -107,3 +107,30 @@ bash runs/eval_three_math_lora_checkpoint.sh /path/lora_checkpoint
 ```
 
 底层通用脚本 `eval_three_math_checkpoint[_vllm].sh` 默认 `CHECKPOINT_TYPE=full`，仅用于兼容现有调用。推荐直接使用上面的类型化入口。
+
+## 全参数 Forward KL + 0.05 clip 实验监控
+
+固定实验入口为：
+
+```bash
+bash runs/train_lulu_full_forward_clip005_7gpu.sh \
+  --train-data /absolute/path/train.jsonl \
+  --output-dir /absolute/path/new_run \
+  --rounds 100 \
+  --global-batch-prompts 64 \
+  --rollout-batch-size 6 \
+  --score-batch-size 6 \
+  --train-micro-batch-size 1
+```
+
+这个入口显式固定 `lora_rank=0`、Forward KL、pointwise clip 0.05，并打开 clip 前 tail diagnostics。实时监控：
+
+```bash
+python scripts/monitor_lulu_training.py \
+  --run-dir /absolute/path/new_run \
+  --pid-file /absolute/path/train.log.pid \
+  --recent-window 10 \
+  --watch
+```
+
+监控器显示 optimizer step 百分比、当前模式、KL 与 clip 配置、最近一轮耗时、全部轮次平均、最近 10 轮平均及基于最近平均速度的 ETA。
