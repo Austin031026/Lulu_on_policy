@@ -1,14 +1,13 @@
 # LuLu / ReN-OPD evaluation
 
-评测直接加载训练产出的 Student，使用现有 `evaluate_plain_model.py`、`benchmark_parser.py`、crossbench Parquet 和指标格式。所有模型使用相同的 greedy decoding；默认启用 Qwen3 thinking。部署时只需 Student checkpoint。
+评测直接加载训练产出的 Student，使用仓库内置的 `scripts/evaluate_plain_model.py` 和 `scripts/benchmark_parser.py`。所有模型使用相同的 greedy decoding；默认启用 Qwen3 thinking。部署时只需本 Lulu checkout、Student checkpoint 和 benchmark 数据。
 
 ## 已有数据与直接运行
 
 从 `Rona_Soraka/LuLu` 目录执行：
 
 ```bash
-export PYTHON=/pfss/mlde/workspaces/mlde_wsp_Eco_Inference/envs/trl/bin/python
-export LULU_SORAKA_ROOT=../Soraka/Global_reasoning
+export PYTHON_BIN="$(command -v python)"
 export DATA_MANIFEST="$(realpath ../Soraka_rlrl/experiments/v6_5-success-q-scale-pool4096-phase11024-seed42/crossbench_v631/data/manifest.json)"
 
 CHECKPOINT=/path/to/lulu-run/checkpoints/step_000100 \
@@ -17,7 +16,7 @@ GPUS=0,1,2,3,4,5,6,7 BATCH_SIZE=8 \
 bash runs/eval_lulu.sh
 ```
 
-通用评测依赖显式指向 `LULU_SORAKA_ROOT`，对应 Python 参数 `--soraka-root`；默认从 LuLu 目录的位置解析相邻 `../Soraka/Global_reasoning`。框架代码包括 `scripts/evaluate_plain_model.py`、`scripts/benchmark_parser.py`，以及可选的 LiveCodeBench 工具；LuLu 不复制这些实现。launcher 不加载 Soraka defaults，不改变当前目录，所以相对 `CHECKPOINT`、`DATA_MANIFEST` 和 `OUTPUT_DIR` 均相对调用时的工作目录。新评测默认输出到 `../LuLu_outputs` 下；已有 benchmark manifest 和历史 checkpoint 继续使用原位置。
+普通数学与选择题评测默认以当前 Lulu checkout 为框架根目录，直接加载本仓库的 runner 和 parser，不需要设置 `LULU_SORAKA_ROOT`。`--soraka-root`/`LULU_SORAKA_ROOT` 仅保留为显式兼容覆盖。launcher 不改变当前目录，所以相对 `CHECKPOINT`、`DATA_MANIFEST` 和 `OUTPUT_DIR` 均相对调用时的工作目录。
 
 Persistent 后端中，`step_000000` 是初始化 checkpoint，`step_000001` 是第一次 optimizer update 后的 Student；旧 staged 后端使用 `round_XXXX` 命名。`CHECKPOINT` 指向含 `adapter_config.json` 和 tokenizer 的 checkpoint 目录，也支持完整 HF 模型目录。无需合并 adapter。`MODEL` 默认是 `Qwen/Qwen3-1.7B`，更换 Student 时一并设置，用于 base 对照。迁移 adapter 后若内部 base 路径失效，可追加 `--adapter-base-model /new/base/path`。
 
@@ -33,7 +32,7 @@ Persistent 后端中，`step_000000` 是初始化 checkpoint，`step_000001` 是
 
 其中 OlympiadBench 和 MMLU-Pro 是现有框架准备的固定子集；`full` 指该 manifest 的 full split。总计每模型 2640 个样本，包含数学与 general reasoning。`selector_crossbench_v6_52/data/manifest.json` 使用另一种 schema，不适用于此入口；这里使用 `crossbench_v631/data/manifest.json`。
 
-数学题复用已验证的 S2T parser。默认读取所选 Soraka 根目录下的 `.cache/select_to_think/parser.py`；也可设置 `S2T_MATH_PARSER=/absolute/path/parser.py`。MCQ 复用现有答案字母提取与比较逻辑。
+数学题使用仓库内置 parser 调用 Math-Verify；MCQ 使用仓库内置答案字母提取与比较逻辑。逐题输出保留解析结果、命中的 gold answer 和评分错误。
 
 ## 并行、预算和快速检查
 
@@ -71,7 +70,6 @@ bash runs/eval_lulu_checkpoints.sh
 
 ```bash
 "$PYTHON" scripts/evaluate_lulu.py \
-  --soraka-root "$LULU_SORAKA_ROOT" \
   --model Qwen/Qwen3-1.7B --include-base \
   --checkpoint ren=/path/ren/checkpoints/step_000100 \
   --checkpoint opd=/path/vanilla-opd/checkpoints/step_000100 \

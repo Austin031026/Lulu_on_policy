@@ -10,10 +10,9 @@ DEFAULT_OUTPUT_ROOT = Path(os.environ.get('LULU_OUTPUT_ROOT', str(WORKSPACE_ROOT
 
 
 def soraka_root(value: str | Path | None = None) -> Path:
-    """Locate the optional shared evaluation framework explicitly.
+    """Locate the evaluation framework, which is bundled with Lulu by default.
 
-    Training and data preparation do not require Soraka. Evaluation defaults to
-    the sibling checkout; an external checkout can be selected by argument/env.
+    An external compatible checkout can still be selected by argument/env.
     """
     location = value if value is not None else os.environ.get('LULU_SORAKA_ROOT')
-    return Path(location).expanduser().resolve() if location else WORKSPACE_ROOT / 'Soraka' / 'Global_reasoning'
+    return Path(location).expanduser().resolve() if location else PROJECT_ROOT

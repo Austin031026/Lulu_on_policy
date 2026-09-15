@@ -17,6 +17,7 @@ Rona_LuLu/
 - `scripts/evaluate_lulu.py` 或 `runs/eval_lulu.sh`：base／多个 checkpoint 的通用评测。
 - `runs/eval_lulu_checkpoints.sh`：一次评测 base 与同一 run 的多个保留 step。
 - `lulu/objective.py`：可独立复用的 target 和 forward KL。
+- `md/lulu_algorithm_overview.md`：两个算法共享的训练设计及子文档入口。
 
 ## 算法与边界
 
@@ -39,6 +40,8 @@ ReN 只启用明确的 `<think>...</think>` reasoning span，支持 token 上限
 每条有 reasoning 的轨迹先对 reasoning positions 取平均，再对全局有效轨迹取平均。没有 positive correction 的 position **仍保留**，target 等于 frozen pC：更新起点 KL/gradient 为零；Student 更新后，该位置可以产生回到 snapshot 的约束。它不是永远零梯度，也不是按 novelty score 加权或筛选轨迹。
 
 默认 `--pointwise-kl-clip 0.05`：在对词表求和前，将每个 vocabulary entry 的 forward-KL contribution 上限裁剪为 0.05，与 OPSD Thinking 配置的默认值一致；设为 0 可关闭以做消融。这不是整个位点 KL clipping，也不是更新前后 Student 的 trust-region 约束。
+
+新增的 `ren_weighted_opd` 是独立可选模式，不改变 `ren_opd`：对每个 reasoning 位置取 `H=TopK(pH)`，计算 `alpha=qT(H)`，训练目标为 `alpha*KL(qT||pθ)+(1-alpha)*KL(pC||pθ)`。hindsight 只决定识别集合，Teacher 仍只接收 causal prompt 和 sampled prefix。首次加权实验明确传 `--pointwise-kl-clip 0`，保留截断功能但先关闭；之后可传正数做 clip 消融。文档入口见 [`md/lulu_algorithm_overview.md`](md/lulu_algorithm_overview.md)。
 
 默认每轮一整个 rollout batch、一次全局 optimizer update，然后刷新快照和 rollout。常驻后端只接受 `--update-passes 1`：本轮全部轨迹和 target 准备完成后才进入 DDP update，下一轮必须等待更新与 hindsight 权重同步完成。优化器状态跨 round 常驻；断点续训从完整 checkpoint 恢复，未完成 round 重新采样、评分。旧的 `--backend staged` 仍支持多次 update-passes，但后续更新使用的是本轮旧快照采样的轨迹。
 
@@ -168,6 +171,7 @@ Qwen3-32B 未在本机已检查的 cache 中，需要先提供其本地路径／
 | `--method` | Target |
 | --- | --- |
 | `ren_opd`（默认） | pC background + positive Teacher corrections on H minus C |
+| `ren_weighted_opd` | `alpha KL(qT||pθ) + (1-alpha) KL(pC||pθ)`，`alpha=qT(TopK(pH))` |
 | `vanilla_opd` | 完整 qT |
 | `opsd` | 完整 frozen pH，直接作为 target |
 | `causal_topk` | qT 投影到 causal Top-K，再归一化 |
@@ -180,14 +184,43 @@ Qwen3-32B 未在本机已检查的 cache 中，需要先提供其本地路径／
 详见 [LuLu evaluation 说明](md/lulu_evaluation.md)。默认套件同时含数学与 general reasoning：MATH500、AIME25、OlympiadBench、MMLU-Pro、GPQA Diamond。支持可选 LiveCodeBench 官方评分、任意已有 benchmark Parquet、多 checkpoint 与 base 配对比较。
 
 ```bash
-export LULU_SORAKA_ROOT=../Soraka/Global_reasoning
 export DATA_MANIFEST=../Soraka_rlrl/experiments/v6_5-success-q-scale-pool4096-phase11024-seed42/crossbench_v631/data/manifest.json
 export CHECKPOINT=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest
 export OUTPUT_DIR=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/evaluation
 PYTHON="$PYTHON_BIN" GPUS=0,1,2,4,5,6,7 BATCH_SIZE=8 bash runs/eval_lulu.sh
 ```
 
-评测只运行部署时的 Student，无 Teacher/hindsight/gold prompt。Checkpoint 是普通 HF／PEFT 文件，可以被现有工具继续加载。
+评测 runner 和 benchmark parser 位于本仓库 `scripts/`，默认不依赖相邻 Soraka checkout。评测只运行部署时的 Student，无 Teacher/hindsight/gold prompt。Checkpoint 是普通 HF／PEFT 文件，可以被现有工具继续加载。
+
+对一个 checkpoint 运行固定的 Math500、OlympiadBench、AIME2025 套件时，只需传入 checkpoint：
+
+```bash
+bash runs/eval_three_math_checkpoint.sh /absolute/path/to/checkpoints/step_000020
+```
+
+该入口自动复用既有离线 JSONL，首次运行时由本仓库脚本转成 Parquet；默认使用 GPU `0,1,2,4,5,6,7`、单卡 8 道题、Thinking Mode 和 greedy 单 rollout。可通过 `BATCH_SIZE`、`GPUS`、`MAX_RESPONSE_TOKENS` 覆盖。
+
+完整七卡运行前可先做单卡端到端 smoke；它对三个 benchmark 各跑 8 题：
+
+```bash
+GPUS=0 BATCH_SIZE=8 MAX_EXAMPLES=8 \
+OUTPUT_DIR=/path/to/empty/smoke-output \
+bash runs/eval_three_math_checkpoint.sh /absolute/path/to/checkpoints/step_000020
+```
+
+需要沿用离线数学评测的 vLLM、每题 4 条采样和 Pass@4 口径时，使用专用入口：
+
+```bash
+# 单卡 smoke：三个 benchmark 各取 8 题，共生成 24 × 4 条轨迹
+GPUS=0 BATCH_SIZE=8 MAX_EXAMPLES=8 \
+bash runs/eval_three_math_checkpoint_vllm.sh /absolute/path/to/checkpoints/step_000020
+
+# 完整评测：500 + 580 + 30 题，每题 4 条轨迹
+GPUS=0,1,2,4,5,6,7 BATCH_SIZE=8 MAX_EXAMPLES=0 \
+bash runs/eval_three_math_checkpoint_vllm.sh /absolute/path/to/checkpoints/step_000020
+```
+
+该 vLLM 入口、checkpoint 合并、分片调度和汇总属于 Lulu-101；生成及 Math-Verify 复用 `LULU_OFFLINE_EVAL_ROOT` 下已经验证的三个离线脚本。默认输出 Pass@1、Pass@4 与 rollout accuracy。
 
 DAPO held-out dev 也可直接评测：
 

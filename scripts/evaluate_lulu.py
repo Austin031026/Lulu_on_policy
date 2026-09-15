@@ -170,6 +170,7 @@ def load_model_assets(model_id, *, dtype, device, thinking, trust_remote_code=Fa
     if tokenizer.pad_token_id is None:
         raise ValueError("tokenizer must define a pad or EOS token")
     tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
     model = model.to(device).eval()
     model.config.use_cache = True
     # Compare checkpoints under identical strict greedy decoding, independent of
@@ -237,7 +238,8 @@ def run_worker(plan, shard_id):
                     model_id=model["model"], input_parquet=benchmark["path"],
                     output=str(output / f"shard-{shard_id:03d}.jsonl"),
                     shard_id=shard_id, num_shards=len(plan["devices"]),
-                    max_examples=plan["max_examples"], store_text=plan["store_text"], progress_every=8,
+                    max_examples=plan["max_examples"], store_text=plan["store_text"],
+                    progress_every=8, scorer=benchmark["scorer"],
                 )
     finally:
         runner.close()
@@ -405,7 +407,7 @@ def argument_parser():
     p.add_argument("--benchmarks", help="comma-separated manifest names; default five math/general benchmarks; 'all' includes coding")
     p.add_argument("--split", choices=["probe", "full"], default="full")
     p.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT / "evaluation"))
-    p.add_argument("--soraka-root", help="shared Soraka/Global_reasoning checkout (default: sibling; LULU_SORAKA_ROOT overrides)")
+    p.add_argument("--soraka-root", help="evaluation framework root (default: this Lulu checkout; LULU_SORAKA_ROOT overrides)")
     p.add_argument("--gpus", default="auto", help="physical GPU IDs/UUIDs; auto respects CUDA_VISIBLE_DEVICES")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--max-response-tokens", type=int, default=8192)

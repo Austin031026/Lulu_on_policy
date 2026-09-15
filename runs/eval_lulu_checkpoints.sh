@@ -9,7 +9,7 @@ set -euo pipefail
 RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$RUN_DIR/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
-SORAKA_ROOT="${LULU_SORAKA_ROOT:-$WORKSPACE_ROOT/Soraka/Global_reasoning}"
+SORAKA_ROOT="${LULU_SORAKA_ROOT:-$ROOT_DIR}"
 
 : "${TRAIN_OUTPUT_DIR:?Set TRAIN_OUTPUT_DIR to the completed LuLu training run}"
 : "${DATA_MANIFEST:?Set DATA_MANIFEST to the benchmark manifest.json}"

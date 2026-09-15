@@ -4,10 +4,9 @@ set -euo pipefail
 RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$RUN_DIR/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
-SORAKA_ROOT="${LULU_SORAKA_ROOT:-$WORKSPACE_ROOT/Soraka/Global_reasoning}"
+SORAKA_ROOT="${LULU_SORAKA_ROOT:-$ROOT_DIR}"
 export MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
-# The selected benchmark parser resolves its own .cache/select_to_think/parser.py.
-# Forward an explicit legacy override without pinning a different --soraka-root.
+# Preserve the legacy parser override for compatible external evaluation roots.
 [[ -z "${S2T_PARSER:-}" ]] || export S2T_MATH_PARSER="${S2T_MATH_PARSER:-$S2T_PARSER}"
 args=(--model "$MODEL" --soraka-root "$SORAKA_ROOT"
       --output-dir "${OUTPUT_DIR:-${LULU_OUTPUT_ROOT:-$WORKSPACE_ROOT/LuLu_outputs}/evaluation}"

@@ -39,12 +39,13 @@ class EvaluationPlanTests(unittest.TestCase):
         self.assertEqual({b["name"] for b in plan["benchmarks"]}, set(evaluation.DEFAULT_BENCHMARKS))
         self.assertIn("mmlu_pro", [b["name"] for b in plan["benchmarks"]])
         self.assertIn("gpqa_diamond", [b["name"] for b in plan["benchmarks"]])
-        self.assertTrue(all(b["path"] == str(self.root / "data.parquet") for b in plan["benchmarks"]))
+        self.assertTrue(all(b["path"] == str((self.root / "data.parquet").resolve())
+                            for b in plan["benchmarks"]))
         self.assertFalse((self.root / "out").exists())
 
     def test_default_shared_framework_and_output_are_workspace_relative(self):
         plan = evaluation.build_plan(self.args())
-        framework = SCRIPT.parents[2] / "Soraka" / "Global_reasoning"
+        framework = SCRIPT.parents[1]
         self.assertEqual(Path(plan["soraka_root"]), framework)
         self.assertEqual(Path(plan["parser_path"]), framework / "scripts" / "benchmark_parser.py")
         self.assertEqual(evaluation.argument_parser().parse_args([]).output_dir,
@@ -57,9 +58,9 @@ class EvaluationPlanTests(unittest.TestCase):
         parser.write_text("# dry-run fixture\n")
         with patch.dict(os.environ, {"LULU_SORAKA_ROOT": str(alternate)}):
             from_env = evaluation.build_plan(self.args())
-            self.assertEqual(from_env["soraka_root"], str(alternate))
-            self.assertEqual(from_env["parser_path"], str(parser))
-            original = SCRIPT.parents[2] / "Soraka" / "Global_reasoning"
+            self.assertEqual(from_env["soraka_root"], str(alternate.resolve()))
+            self.assertEqual(from_env["parser_path"], str(parser.resolve()))
+            original = SCRIPT.parents[1]
             explicit = evaluation.build_plan(self.args("--soraka-root", str(original)))
             self.assertEqual(explicit["soraka_root"], str(original))
             self.assertEqual(explicit["parser_path"], str(original / "scripts/benchmark_parser.py"))
@@ -68,19 +69,20 @@ class EvaluationPlanTests(unittest.TestCase):
         (self.root / "student").mkdir()
         env = dict(os.environ)
         for key in ("DATA_MANIFEST", "EVAL_DATA", "BENCHMARKS", "CHECKPOINT", "LCB_REPO",
-                    "S2T_MATH_PARSER", "S2T_PARSER", "OUTPUT_DIR", "LULU_OUTPUT_ROOT"):
+                    "S2T_MATH_PARSER", "S2T_PARSER", "OUTPUT_DIR", "LULU_OUTPUT_ROOT",
+                    "LULU_SORAKA_ROOT"):
             env.pop(key, None)
         env.update(PYTHON_BIN=sys.executable, PYTHON="/missing/python", GPUS="cpu",
                    DATA_MANIFEST="manifest.json", CHECKPOINT="student", OUTPUT_DIR="eval-output",
-                   DRY_RUN="1", INCLUDE_BASE="0", BATCH_SIZE="16", PYTHONPATH="",
-                   LULU_SORAKA_ROOT=str(SCRIPT.parents[2] / "Soraka" / "Global_reasoning"))
+                   DRY_RUN="1", INCLUDE_BASE="0", BATCH_SIZE="16", PYTHONPATH="")
         completed = subprocess.run(["bash", str(SCRIPT.parents[1] / "runs" / "eval_lulu.sh")],
                                    cwd=self.root, env=env, check=True, text=True, capture_output=True)
         plan = json.loads(completed.stdout)
-        self.assertEqual(plan["output_dir"], str(self.root / "eval-output"))
-        self.assertEqual(plan["models"], [{"name": "lulu", "model": str(self.root / "student")}])
+        self.assertEqual(plan["output_dir"], str((self.root / "eval-output").resolve()))
+        self.assertEqual(plan["models"], [{"name": "lulu", "model": str((self.root / "student").resolve())}])
         self.assertEqual(plan["batch_size"], 16)
-        self.assertTrue(all(b["path"] == str(self.root / "data.parquet") for b in plan["benchmarks"]))
+        self.assertTrue(all(b["path"] == str((self.root / "data.parquet").resolve())
+                            for b in plan["benchmarks"]))
         self.assertFalse((self.root / "eval-output").exists())
 
     def test_named_checkpoints_base_control_and_generation_flags(self):
@@ -148,6 +150,20 @@ class EvaluationSummaryTests(unittest.TestCase):
         self.assertEqual(summary["scored_examples"], 0)
         self.assertIsNone(summary["accuracy"])
 
+    def test_bundled_runner_and_parser_are_present_and_choice_parser_scores(self):
+        scripts = SCRIPT.parent
+        runner = scripts / "evaluate_plain_model.py"
+        parser = scripts / "benchmark_parser.py"
+        self.assertTrue(runner.is_file())
+        self.assertTrue(parser.is_file())
+        spec = importlib.util.spec_from_file_location("bundled_benchmark_parser", parser)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(
+            module.score_prediction("Answer: C", "__CHOICE__C", scorer="choice")["reward"],
+            1.0,
+        )
+
     def test_livecodebench_helpers_use_explicit_shared_framework(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -159,10 +175,10 @@ class EvaluationSummaryTests(unittest.TestCase):
                 scored = evaluation.score_livecodebench(plan, benchmark, root / "raw")
             self.assertEqual(scored, root / "raw/scored")
             self.assertEqual(run.call_args_list[0].args[0][1],
-                             str(root / "shared/scripts/export_livecodebench_custom.py"))
+                             str((root / "shared/scripts/export_livecodebench_custom.py").resolve()))
             self.assertEqual(run.call_args_list[1].kwargs["cwd"], str(root / "official"))
             self.assertEqual(run.call_args_list[2].args[0][1],
-                             str(root / "shared/scripts/inject_livecodebench_rewards.py"))
+                             str((root / "shared/scripts/inject_livecodebench_rewards.py").resolve()))
 
     def test_merge_requires_complete_exact_disjoint_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
