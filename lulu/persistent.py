@@ -167,6 +167,11 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
     optimizer.zero_grad(set_to_none=True)
     device = tr.device_for(a)
     loss_sum = torch.zeros((), device=device)
+    diagnostics = tr.kl_diagnostics_enabled(a)
+    thresholds = getattr(a, 'kl_diagnostic_thresholds', tr.DEFAULT_KL_DIAGNOSTIC_THRESHOLDS)
+    diagnostic_sums = torch.zeros((2, 8 + 3 * len(thresholds)), device=device, dtype=torch.float64)
+    diagnostic_maxima = torch.full((2,), -torch.inf, device=device, dtype=torch.float64)
+    diagnostic_sequence_sums = torch.zeros((2,), device=device, dtype=torch.float64)
     counts = torch.tensor([sum(len(r['positions']) for r in records),
                            sum(bool(r['positions']) for r in records)], device=device, dtype=torch.long)
     started = time.monotonic()
@@ -179,12 +184,23 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
         last = start+a.train_micro_batch_size >= len(local)
         context = distributed.no_sync() if world > 1 and not last else contextlib.nullcontext()
         with context:
-            value = distributed(batch)
+            result = distributed(batch)
+            if diagnostics:
+                value, batch_sums, batch_maxima, batch_sequence_sums = result
+                diagnostic_sums += batch_sums
+                diagnostic_maxima = torch.maximum(diagnostic_maxima, batch_maxima)
+                diagnostic_sequence_sums += batch_sequence_sums
+            else:
+                value = result
             (value*(world/expected)).backward()
         loss_sum += value.detach()
     if world > 1:
         dist.all_reduce(loss_sum)
         dist.all_reduce(counts)
+        if diagnostics:
+            dist.all_reduce(diagnostic_sums)
+            dist.all_reduce(diagnostic_maxima, op=dist.ReduceOp.MAX)
+            dist.all_reduce(diagnostic_sequence_sums)
     positions, active = counts.tolist()
     if not active:
         raise RuntimeError('No reasoning tokens in round; increase rollout budget or inspect thinking markers')
@@ -195,9 +211,24 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
     if not torch.isfinite(loss_sum):
         raise FloatingPointError('Non-finite distillation loss')
     optimizer.step()
-    return {'round': a.round, 'completed_updates': a.round+1, 'forward_kl': loss_sum.item()/active,
-            'grad_norm': grad.item(), 'reasoning_tokens': positions, 'supervised_trajectories': active,
-            'trajectories': expected, 'update_seconds': time.monotonic()-started}
+    direction = getattr(a, 'kl_direction', 'forward')
+    optimization_kl = loss_sum.item()/active
+    entry = {'round': a.round, 'completed_updates': a.round+1,
+             'kl_direction': direction, 'optimization_kl': optimization_kl,
+             'grad_norm': grad.item(), 'reasoning_tokens': positions,
+             'supervised_trajectories': active, 'trajectories': expected,
+             'update_seconds': time.monotonic()-started}
+    if diagnostics:
+        detail = tr.summarize_kl_diagnostics(
+            diagnostic_sums, diagnostic_maxima, diagnostic_sequence_sums, active, thresholds)
+        entry['forward_kl'] = (optimization_kl if direction == 'forward'
+                               else detail['forward']['sequence_mean_configured_clip'])
+        entry['reverse_kl'] = (optimization_kl if direction == 'reverse'
+                               else detail['reverse']['sequence_mean_configured_clip'])
+        entry['pointwise_kl_statistics'] = detail
+    else:
+        entry['forward_kl'] = optimization_kl
+    return entry
 
 
 def student_worker(a, rank, world, ids, port, conn):
@@ -529,7 +560,8 @@ def run_persistent(a):
         raise ValueError('Persistent backend uses RAM caches; --keep-round-cache requires --backend staged')
     roles = allocate_roles(a)
     plan = {'backend': 'persistent', 'model': a.model, 'teacher': a.teacher_model,
-            'method': a.method, 'roles': roles,
+            'method': a.method, 'kl_direction': a.kl_direction,
+            'kl_diagnostics': tr.kl_diagnostics_enabled(a), 'roles': roles,
             'teacher_parallelism': ('tensor_parallel' if roles['teacher'] and len(roles['teacher']) > 1
                                     else 'single_process' if roles['teacher'] is not None else None),
             'rollouts_per_round': a.global_batch_prompts*a.rollouts_per_prompt,
@@ -552,7 +584,7 @@ def run_persistent(a):
     config = {k: v for k, v in vars(a).items() if k not in ignored}
     config['train_sha256'] = hashlib.sha256(Path(a.train_data).read_bytes()).hexdigest()
     operational = {'train_data', 'output_dir', 'save_every', 'worker_timeout'}
-    scientific = lambda c: {k: v for k, v in c.items() if k not in operational}
+    scientific = lambda c: {k: v for k, v in tr.with_kl_defaults(c).items() if k not in operational}
     manager = None
     if manifest.exists():
         if not a.resume:

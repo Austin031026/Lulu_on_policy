@@ -25,6 +25,7 @@ from torch.nn import functional as F
 
 
 METHODS = ("ren_opd", "ren_weighted_opd", "vanilla_opd", "opsd", "causal_topk", "union_topk")
+KL_DIRECTIONS = ("forward", "reverse")
 
 
 def _math_dtype(*values: torch.Tensor | None) -> torch.dtype:
@@ -336,6 +337,147 @@ def forward_kl(
         contributions = contributions.clamp(max=pointwise_clip)
     position_kl = contributions.sum(-1)
     return reduce_position_losses(position_kl, mask, reduction=reduction, sequence_ids=sequence_ids)
+
+
+def reverse_kl(
+    student_logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    reduction: str = "sequence_mean",
+    sequence_ids: torch.Tensor | None = None,
+    pointwise_clip: float | None = None,
+) -> torch.Tensor:
+    """Compute KL(student || stopgrad(target)), differentiating only Student.
+
+    The target is floored at the smallest positive value of the KL math dtype
+    and renormalized. This only affects probabilities that underflowed to zero
+    while materializing an otherwise dense FP32 target; it avoids artificial
+    infinities in reverse KL without adding meaningful vocabulary mass.
+
+    As in :func:`forward_kl`, pointwise clipping caps each vocabulary-level
+    contribution before the vocabulary sum. Individual contributions can be
+    negative even though the unclipped sum is nonnegative.
+    """
+    if student_logits.ndim < 2 or student_logits.shape != target_probs.shape:
+        raise ValueError("student_logits and target_probs must have identical [..., vocabulary] shapes")
+    if student_logits.device != target_probs.device:
+        raise ValueError("student_logits and target_probs must be on the same device")
+    if not student_logits.is_floating_point() or not target_probs.is_floating_point():
+        raise ValueError("student_logits and target_probs must be floating-point tensors")
+    if pointwise_clip is not None and (isinstance(pointwise_clip, bool) or pointwise_clip <= 0):
+        raise ValueError("pointwise_clip must be a positive number or None")
+    dtype = _math_dtype(student_logits, target_probs)
+    target = target_probs.detach().to(dtype)
+    if bool((target < 0).any()) or bool((target.sum(-1) <= 0).any()):
+        raise ValueError("target_probs must be nonnegative with positive mass at every position")
+    target = target.clamp_min(torch.finfo(dtype).tiny)
+    target = target / target.sum(-1, keepdim=True)
+    log_target = target.log()
+    log_student = F.log_softmax(student_logits.to(dtype), dim=-1)
+    student = log_student.exp()
+    contributions = student * (log_student - log_target)
+    if pointwise_clip is not None:
+        contributions = contributions.clamp(max=pointwise_clip)
+    position_kl = contributions.sum(-1)
+    return reduce_position_losses(position_kl, mask, reduction=reduction, sequence_ids=sequence_ids)
+
+
+def directional_kl(
+    student_logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    direction: str = "forward",
+    reduction: str = "sequence_mean",
+    sequence_ids: torch.Tensor | None = None,
+    pointwise_clip: float | None = None,
+) -> torch.Tensor:
+    """Dispatch to forward or reverse full-vocabulary KL."""
+    if direction not in KL_DIRECTIONS:
+        raise ValueError(f"unknown KL direction={direction!r}; expected one of {KL_DIRECTIONS}")
+    function = forward_kl if direction == "forward" else reverse_kl
+    return function(
+        student_logits, target_probs, mask, reduction=reduction,
+        sequence_ids=sequence_ids, pointwise_clip=pointwise_clip,
+    )
+
+
+@torch.no_grad()
+def pointwise_kl_statistics(
+    student_logits: torch.Tensor,
+    target_probs: torch.Tensor,
+    thresholds: list[float] | tuple[float, ...],
+    *,
+    pointwise_clip: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return exact streaming statistics for forward and reverse contributions.
+
+    The additive tensor has shape ``[2, 8 + 3*len(thresholds)]`` in
+    ``(forward, reverse)`` order. Its first eight columns are position count,
+    vocabulary-entry count, unclipped contribution sum, configured-clipped
+    contribution sum, positive mass, signed negative mass, positive count, and
+    negative count. Every threshold then contributes ``(exceed_entry_count,
+    affected_position_count, removed_positive_mass)``. The second tensor contains the maximum
+    contribution for each direction and must be aggregated with MAX rather
+    than SUM.
+
+    These sufficient statistics form an exact complementary distribution at
+    the requested thresholds without retaining a trajectory-sized
+    ``[positions, vocabulary]`` tensor.
+    """
+    if student_logits.ndim < 2 or student_logits.shape != target_probs.shape:
+        raise ValueError("student_logits and target_probs must have identical [..., vocabulary] shapes")
+    if student_logits.device != target_probs.device:
+        raise ValueError("student_logits and target_probs must be on the same device")
+    checked = []
+    for value in thresholds:
+        value = float(value)
+        if not torch.isfinite(torch.tensor(value)) or value <= 0:
+            raise ValueError("diagnostic KL thresholds must be finite positive numbers")
+        checked.append(value)
+    if checked != sorted(set(checked)):
+        raise ValueError("diagnostic KL thresholds must be unique and increasing")
+    if pointwise_clip is not None and (isinstance(pointwise_clip, bool) or pointwise_clip <= 0):
+        raise ValueError("pointwise_clip must be a positive number or None")
+
+    dtype = _math_dtype(student_logits, target_probs)
+    target = target_probs.detach().to(dtype)
+    if bool((target < 0).any()) or bool((target.sum(-1) <= 0).any()):
+        raise ValueError("target_probs must be nonnegative with positive mass at every position")
+    reverse_target = target.clamp_min(torch.finfo(dtype).tiny)
+    reverse_target = reverse_target / reverse_target.sum(-1, keepdim=True)
+    log_student = F.log_softmax(student_logits.detach().to(dtype), dim=-1)
+    student = log_student.exp()
+    forward = torch.xlogy(target, target) - target * log_student
+    reverse = student * (log_student - reverse_target.log())
+
+    rows = []
+    maxima = []
+    positions = student_logits.numel() // student_logits.shape[-1]
+    entries = student_logits.numel()
+    for contributions in (forward, reverse):
+        positive = contributions.clamp_min(0)
+        negative = contributions.clamp_max(0)
+        configured = (contributions.clamp(max=pointwise_clip)
+                      if pointwise_clip is not None else contributions)
+        values = [
+            float(positions), float(entries), contributions.sum(), configured.sum(),
+            positive.sum(), negative.sum(), (contributions > 0).sum(),
+            (contributions < 0).sum(),
+        ]
+        for threshold in checked:
+            excess = (contributions - threshold).clamp_min(0)
+            exceeded = contributions > threshold
+            values.extend((exceeded.sum(), exceeded.any(-1).sum(), excess.sum()))
+        rows.append(torch.stack([
+            value.to(device=contributions.device, dtype=torch.float64)
+            if isinstance(value, torch.Tensor)
+            else torch.tensor(value, device=contributions.device, dtype=torch.float64)
+            for value in values
+        ]))
+        maxima.append(contributions.max().to(torch.float64))
+    return torch.stack(rows), torch.stack(maxima)
 
 
 def recognition_weighted_forward_kl(

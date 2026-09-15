@@ -41,6 +41,8 @@ ReN 只启用明确的 `<think>...</think>` reasoning span，支持 token 上限
 
 默认 `--pointwise-kl-clip 0.05`：在对词表求和前，将每个 vocabulary entry 的 forward-KL contribution 上限裁剪为 0.05，与 OPSD Thinking 配置的默认值一致；设为 0 可关闭以做消融。这不是整个位点 KL clipping，也不是更新前后 Student 的 trust-region 约束。
 
+`--kl-direction forward|reverse` 选择优化 `KL(target||Student)` 或 `KL(Student||target)`；默认仍为 forward，旧实验语义不变。Reverse 使用同一个 ReN target、数据、采样和 pointwise clip，并自动记录同一批 reasoning positions 上的 forward/reverse shadow KL。`--kl-diagnostics` 也可用于 forward 实验：它按 `--kl-diagnostic-thresholds` 在线精确累计每个词表 contribution 的超阈值数量、比例和被裁掉的正 contribution 质量，不保存巨大的 token×vocabulary 张量。使用 `scripts/analyze_kl_diagnostics.py` 汇总 KL 曲线与 clip tail 分布。完整定义和实验命令见 [`md/lulu_reverse_kl.md`](md/lulu_reverse_kl.md)。
+
 新增的 `ren_weighted_opd` 是独立可选模式，不改变 `ren_opd`：对每个 reasoning 位置取 `H=TopK(pH)`，计算 `alpha=qT(H)`，训练目标为 `alpha*KL(qT||pθ)+(1-alpha)*KL(pC||pθ)`。hindsight 只决定识别集合，Teacher 仍只接收 causal prompt 和 sampled prefix。首次加权实验明确传 `--pointwise-kl-clip 0`，保留截断功能但先关闭；之后可传正数做 clip 消融。文档入口见 [`md/lulu_algorithm_overview.md`](md/lulu_algorithm_overview.md)。
 
 默认每轮一整个 rollout batch、一次全局 optimizer update，然后刷新快照和 rollout。常驻后端只接受 `--update-passes 1`：本轮全部轨迹和 target 准备完成后才进入 DDP update，下一轮必须等待更新与 hindsight 权重同步完成。优化器状态跨 round 常驻；断点续训从完整 checkpoint 恢复，未完成 round 重新采样、评分。旧的 `--backend staged` 仍支持多次 update-passes，但后续更新使用的是本轮旧快照采样的轨迹。

@@ -28,11 +28,25 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 
 from lulu.data import build_prompt_views, load_prepared_jsonl, reasoning_token_mask
-from lulu.objective import (build_cached_target, forward_kl, probability_mass_at_ids,
+from lulu.objective import (build_cached_target, directional_kl,
+                            pointwise_kl_statistics, probability_mass_at_ids,
                             recognition_weighted_forward_kl)
 from lulu.paths import PROJECT_ROOT
 
 METHODS = ('ren_opd', 'ren_weighted_opd', 'vanilla_opd', 'opsd', 'causal_topk', 'union_topk')
+DEFAULT_KL_DIAGNOSTIC_THRESHOLDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1]
+
+
+def positive_float_list(value):
+    try:
+        values = [float(item.strip()) for item in value.split(',') if item.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('expected comma-separated floating-point thresholds') from exc
+    if not values or any(not math.isfinite(item) or item <= 0 for item in values):
+        raise argparse.ArgumentTypeError('KL diagnostic thresholds must be finite and positive')
+    if values != sorted(set(values)):
+        raise argparse.ArgumentTypeError('KL diagnostic thresholds must be unique and increasing')
+    return values
 
 
 def parser():
@@ -68,8 +82,15 @@ def parser():
     p.add_argument('--learning-rate', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=0.0)
     p.add_argument('--max-grad-norm', type=float, default=1.0)
+    p.add_argument('--kl-direction', choices=('forward', 'reverse'), default='forward',
+                   help='Optimize KL(target||Student) or KL(Student||target)')
     p.add_argument('--pointwise-kl-clip', type=float, default=0.05,
-                   help='Cap each vocabulary-level forward-KL contribution before summing; 0 disables')
+                   help='Cap each vocabulary-level selected-KL contribution before summing; 0 disables')
+    p.add_argument('--kl-diagnostics', action=argparse.BooleanOptionalAction, default=False,
+                   help='Record forward/reverse KL and exact pointwise clip tail statistics')
+    p.add_argument('--kl-diagnostic-thresholds', type=positive_float_list,
+                   default=DEFAULT_KL_DIAGNOSTIC_THRESHOLDS.copy(),
+                   help='Increasing comma-separated pointwise thresholds for tail diagnostics')
     p.add_argument('--lora-rank', type=int, default=16, help='0 for full parameter training')
     p.add_argument('--lora-alpha', type=int, default=32)
     p.add_argument('--lora-target-modules', default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
@@ -102,6 +123,10 @@ def validate_args(a):
         raise ValueError('Invalid LoRA rank, teacher worker count or learning rate')
     if a.pointwise_kl_clip < 0:
         raise ValueError('pointwise_kl_clip must be nonnegative; 0 disables clipping')
+    if a.kl_direction == 'reverse' and a.method == 'ren_weighted_opd':
+        raise ValueError('reverse KL is not defined for ren_weighted_opd; use ren_opd or another explicit target')
+    if a.kl_diagnostics and a.method == 'ren_weighted_opd':
+        raise ValueError('KL diagnostics require an explicit target and do not support ren_weighted_opd')
     unsupported_heads = {'lm_head', 'embed_tokens', 'embed_in', 'embed_out', 'wte',
                          'word_embeddings', 'tok_embeddings', 'embeddings'}
     targets = {name.strip().rsplit('.', 1)[-1] for name in a.lora_target_modules.split(',')}
@@ -111,6 +136,64 @@ def validate_args(a):
         raise ValueError('max_sequence_tokens must cover max_prompt_tokens + max_new_tokens')
     if a.cpu and a.dtype != 'float32':
         raise ValueError('--cpu requires --dtype float32')
+
+
+def kl_diagnostics_enabled(a):
+    """Reverse runs always retain the forward shadow metric for comparison."""
+    return bool(getattr(a, 'kl_diagnostics', False) or getattr(a, 'kl_direction', 'forward') == 'reverse')
+
+
+def summarize_kl_diagnostics(additive, maxima, sequence_sums, active, thresholds):
+    """Convert globally reduced pointwise sufficient statistics to JSON data."""
+    additive = additive.detach().cpu().to(torch.float64)
+    maxima = maxima.detach().cpu().to(torch.float64)
+    sequence_sums = sequence_sums.detach().cpu().to(torch.float64)
+    payload = {}
+    for direction_index, direction in enumerate(('forward', 'reverse')):
+        row = additive[direction_index]
+        positions = int(row[0].item())
+        entries = int(row[1].item())
+        positive_mass = row[4].item()
+        positive_count = int(row[6].item())
+        direction_payload = {
+            'sequence_mean_configured_clip': sequence_sums[direction_index].item() / max(active, 1),
+            'position_count': positions,
+            'vocabulary_entry_count': entries,
+            'unclipped_position_mean': row[2].item() / max(positions, 1),
+            'configured_clipped_position_mean': row[3].item() / max(positions, 1),
+            'positive_contribution_sum': positive_mass,
+            'negative_contribution_sum': row[5].item(),
+            'positive_contribution_count': positive_count,
+            'negative_contribution_count': int(row[7].item()),
+            'maximum_contribution': maxima[direction_index].item(),
+            'thresholds': {},
+        }
+        for threshold_index, threshold in enumerate(thresholds):
+            offset = 8 + 3 * threshold_index
+            exceed_count = int(row[offset].item())
+            affected_positions = int(row[offset + 1].item())
+            removed_mass = row[offset + 2].item()
+            direction_payload['thresholds'][format(float(threshold), '.12g')] = {
+                'exceed_count': exceed_count,
+                'affected_position_count': affected_positions,
+                'fraction_of_positions_affected': affected_positions / max(positions, 1),
+                'fraction_of_all_vocabulary_entries': exceed_count / max(entries, 1),
+                'fraction_of_positive_contributions': exceed_count / max(positive_count, 1),
+                'removed_positive_mass': removed_mass,
+                'fraction_of_positive_mass_removed': removed_mass / max(positive_mass, torch.finfo(torch.float64).tiny),
+                'implied_clipped_position_mean': (row[2].item() - removed_mass) / max(positions, 1),
+            }
+        payload[direction] = direction_payload
+    return payload
+
+
+def with_kl_defaults(config):
+    """Make manifests written before KL-direction support resume-compatible."""
+    config = dict(config)
+    config.setdefault('kl_direction', 'forward')
+    config.setdefault('kl_diagnostics', False)
+    config.setdefault('kl_diagnostic_thresholds', DEFAULT_KL_DIAGNOSTIC_THRESHOLDS.copy())
+    return config
 
 
 def atomic_json(path, value):
@@ -466,6 +549,12 @@ class DistillationStep(nn.Module):
         hidden = selected_hidden(self.student, self.tok, records, 'causal_prompt_ids', a)
         head = base_model(self.student).get_output_embeddings()
         total = hidden[0].sum() * 0.0
+        diagnostics = kl_diagnostics_enabled(a)
+        thresholds = getattr(a, 'kl_diagnostic_thresholds', DEFAULT_KL_DIAGNOSTIC_THRESHOLDS)
+        diagnostic_width = 8 + 3 * len(thresholds)
+        diagnostic_sums = torch.zeros((2, diagnostic_width), device=hidden[0].device, dtype=torch.float64)
+        diagnostic_maxima = torch.full((2,), -torch.inf, device=hidden[0].device, dtype=torch.float64)
+        diagnostic_sequence_sums = torch.zeros((2,), device=hidden[0].device, dtype=torch.float64)
         for r, hs in zip(records, hidden):
             n = len(r['positions'])
             if not n or r.get('dummy', False):
@@ -473,6 +562,7 @@ class DistillationStep(nn.Module):
                 # Keep a trainable full-finetuning LM head in DDP's graph.
                 total = total + head.weight.reshape(-1)[0] * 0.0
                 continue
+            record_sequence_sums = torch.zeros((2,), device=hs.device, dtype=torch.float64)
             for start in range(0, n, a.logit_chunk_size):
                 end = min(n, start+a.logit_chunk_size)
                 frozen = r['student_hidden'][start:end].to(hs.device)
@@ -488,6 +578,7 @@ class DistillationStep(nn.Module):
 
                 def chunk_loss(live, frozen, ids, probs, th, recognition_ids):
                     clip = getattr(a, 'pointwise_kl_clip', None) or None
+                    direction = getattr(a, 'kl_direction', 'forward')
                     causal_logits = self.frozen_head(frozen)
                     live_logits = head(live)
                     if a.method == 'ren_weighted_opd':
@@ -504,12 +595,30 @@ class DistillationStep(nn.Module):
                             target = causal_logits.float().softmax(-1)
                         else:
                             target = build_cached_target(causal_logits, ids, probs, method=a.method)
-                    return forward_kl(live_logits, target, reduction='none', pointwise_clip=clip).sum()
+                    loss = directional_kl(
+                        live_logits, target, direction=direction,
+                        reduction='none', pointwise_clip=clip).sum()
+                    if not diagnostics:
+                        return loss
+                    sums, maxima = pointwise_kl_statistics(
+                        live_logits, target, thresholds, pointwise_clip=clip)
+                    return loss, sums, maxima
 
-                value = checkpoint(chunk_loss, hs[start:end], frozen, ids, probs, th, recognition_ids,
-                                   use_reentrant=False) if a.gradient_checkpointing else chunk_loss(
-                                       hs[start:end], frozen, ids, probs, th, recognition_ids)
+                result = checkpoint(chunk_loss, hs[start:end], frozen, ids, probs, th, recognition_ids,
+                                    use_reentrant=False) if a.gradient_checkpointing else chunk_loss(
+                                        hs[start:end], frozen, ids, probs, th, recognition_ids)
+                if diagnostics:
+                    value, chunk_sums, chunk_maxima = result
+                    diagnostic_sums = diagnostic_sums + chunk_sums
+                    diagnostic_maxima = torch.maximum(diagnostic_maxima, chunk_maxima)
+                    record_sequence_sums = record_sequence_sums + chunk_sums[:, 3]
+                else:
+                    value = result
                 total = total + value / n
+            if diagnostics:
+                diagnostic_sequence_sums = diagnostic_sequence_sums + record_sequence_sums / n
+        if diagnostics:
+            return total, diagnostic_sums, diagnostic_maxima, diagnostic_sequence_sums
         return total
 
 
@@ -542,6 +651,11 @@ def update_phase(a):
                  for i in range(rank, math.ceil(len(order)/world)*world, world)]
         optimizer.zero_grad(set_to_none=True)
         loss_sum = torch.zeros((), device=device)
+        diagnostics = kl_diagnostics_enabled(a)
+        thresholds = getattr(a, 'kl_diagnostic_thresholds', DEFAULT_KL_DIAGNOSTIC_THRESHOLDS)
+        kl_diagnostic_sums = torch.zeros((2, 8 + 3 * len(thresholds)), device=device, dtype=torch.float64)
+        kl_diagnostic_maxima = torch.full((2,), -torch.inf, device=device, dtype=torch.float64)
+        kl_diagnostic_sequence_sums = torch.zeros((2,), device=device, dtype=torch.float64)
         positions = 0
         active_trajectories = 0
         diagnostic_keys = ('frontier_actions', 'positive_corrections', 'corrected_positions', 'added_mass_sum')
@@ -566,7 +680,14 @@ def update_phase(a):
             last = start+a.train_micro_batch_size >= len(local)
             ctx = distributed.no_sync() if world > 1 and not last else contextlib.nullcontext()
             with ctx:
-                value = distributed(records)
+                result = distributed(records)
+                if diagnostics:
+                    value, batch_sums, batch_maxima, batch_sequence_sums = result
+                    kl_diagnostic_sums += batch_sums
+                    kl_diagnostic_maxima = torch.maximum(kl_diagnostic_maxima, batch_maxima)
+                    kl_diagnostic_sequence_sums += batch_sequence_sums
+                else:
+                    value = result
                 loss = value * (world / expected)
                 loss.backward()
             loss_sum += value.detach()
@@ -576,6 +697,10 @@ def update_phase(a):
             dist.all_reduce(loss_sum)
             dist.all_reduce(counts)
             dist.all_reduce(diagnostic_totals)
+            if diagnostics:
+                dist.all_reduce(kl_diagnostic_sums)
+                dist.all_reduce(kl_diagnostic_maxima, op=dist.ReduceOp.MAX)
+                dist.all_reduce(kl_diagnostic_sequence_sums)
         total_positions, total_active = counts.tolist()
         if total_active == 0:
             raise RuntimeError('No reasoning tokens in round: inspect thinking tags/rollout budget')
@@ -589,10 +714,24 @@ def update_phase(a):
         if not torch.isfinite(loss_sum):
             raise FloatingPointError('Non-finite distillation loss')
         optimizer.step()
-        entry = {'round': a.round, 'update': update, 'forward_kl': loss_sum.item()/total_active,
-                 'grad_norm': grad_norm.item(), 'reasoning_tokens': total_positions,
-                 'trajectories': expected, 'supervised_trajectories': total_active, 'seconds': time.monotonic()-started,
+        direction = getattr(a, 'kl_direction', 'forward')
+        optimization_kl = loss_sum.item()/total_active
+        entry = {'round': a.round, 'update': update, 'kl_direction': direction,
+                 'optimization_kl': optimization_kl, 'grad_norm': grad_norm.item(),
+                 'reasoning_tokens': total_positions, 'trajectories': expected,
+                 'supervised_trajectories': total_active, 'seconds': time.monotonic()-started,
                  **dict(zip(diagnostic_keys, diagnostic_totals.tolist()))}
+        if diagnostics:
+            detail = summarize_kl_diagnostics(
+                kl_diagnostic_sums, kl_diagnostic_maxima, kl_diagnostic_sequence_sums,
+                total_active, thresholds)
+            entry['forward_kl'] = (optimization_kl if direction == 'forward'
+                                   else detail['forward']['sequence_mean_configured_clip'])
+            entry['reverse_kl'] = (optimization_kl if direction == 'reverse'
+                                   else detail['reverse']['sequence_mean_configured_clip'])
+            entry['pointwise_kl_statistics'] = detail
+        else:
+            entry['forward_kl'] = optimization_kl
         metrics.append(entry)
         if rank == 0:
             print(json.dumps(entry), flush=True)
@@ -633,6 +772,8 @@ def child_arguments(a, phase, round_index):
                 args.append(flag)
             elif name == 'gradient_checkpointing':
                 args.append('--no-gradient-checkpointing')
+        elif isinstance(value, (list, tuple)):
+            args.extend((flag, ','.join(map(str, value))))
         else:
             args.extend((flag, str(value)))
     return args + ['--phase', phase, '--round', str(round_index)]
@@ -690,7 +831,7 @@ def resume_settings(config):
     move, without changing trajectories or optimization. All other settings,
     including model identity and the data hash, must still match exactly.
     """
-    config = dict(config)
+    config = with_kl_defaults(config)
     config.setdefault('backend', 'staged')  # Manifests before resident training.
     if config['backend'] == 'staged':
         for key in ('student_gpus', 'hindsight_gpus', 'teacher_gpus', 'save_every', 'worker_timeout'):
@@ -700,13 +841,15 @@ def resume_settings(config):
 
 def run(a):
     ids = gpu_ids(a)
-    plan = {'model': a.model, 'teacher': a.teacher_model, 'method': a.method, 'rounds': a.rounds,
+    plan = {'model': a.model, 'teacher': a.teacher_model, 'method': a.method,
+            'kl_direction': a.kl_direction, 'kl_diagnostics': kl_diagnostics_enabled(a),
+            'rounds': a.rounds,
             'gpus': ids, 'student_workers': max(1, len(ids)),
             'teacher_gpus_per_worker': min(len(ids), a.teacher_gpus_per_worker),
             'rollouts_per_round': a.global_batch_prompts*a.rollouts_per_prompt,
             'optimizer_updates_per_round': a.update_passes,
             'phases': ['student_rollout_and_frozen_views', 'answer_blind_teacher_score', 'ddp_student_update'],
-            'loss': 'exact full-vocabulary forward KL, mean of per-trajectory reasoning-token means',
+            'loss': f'exact full-vocabulary {a.kl_direction} KL, mean of per-trajectory reasoning-token means',
             'rollout_policy': {'temperature': a.temperature, 'top_p': a.top_p, 'top_k': 0}}
     print(json.dumps(plan, indent=2), flush=True)
     if a.dry_run:
