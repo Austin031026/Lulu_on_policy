@@ -69,9 +69,10 @@ def _records(snapshot, method, *, include_empty=False):
             record['diagnostics'] = {'frontier_actions': len(causal) * 3,
                 'positive_corrections': len(causal), 'corrected_positions': len(causal),
                 'added_mass_sum': len(causal) * .1}
-            if method == 'ren_weighted_opd':
-                record['recognition_ids'] = frozen_head(hindsight).topk(3, dim=-1).indices
-            elif method in ('ren_opd', 'causal_topk', 'union_topk'):
+            if method == 'ren_opd':
+                hs = frozen_head(hindsight).topk(3, dim=-1).indices
+                record['recognition_ids'] = hs
+            elif method in ('ren_graft', 'causal_topk', 'union_topk'):
                 cs = frozen_head(causal).topk(3, dim=-1).indices
                 hs = frozen_head(hindsight).topk(3, dim=-1).indices
                 novel = ~hs.unsqueeze(-1).eq(cs.unsqueeze(-2)).any(-1)
@@ -93,7 +94,7 @@ def _dense_loss(student, records, frozen_head, teacher_head, tok, method):
             continue
         causal_logits = frozen_head(r['causal_hidden'])
         teacher_logits = teacher_head(r['teacher_hidden'])
-        if method == 'ren_weighted_opd':
+        if method == 'ren_opd':
             alpha = probability_mass_at_ids(teacher_logits, r['recognition_ids'])
             total = total + recognition_weighted_forward_kl(
                 head(live), causal_logits, teacher_logits, alpha)
@@ -227,7 +228,6 @@ def test_two_rank_update_matches_global_nonempty_sequence_mean_with_dummy_rank(t
     assert metrics['trajectories'] == 3
     assert metrics['supervised_trajectories'] == 2
     assert metrics['reasoning_tokens'] == 6
-    assert metrics['frontier_actions'] == 18
     assert metrics['forward_kl'] == pytest.approx(reference.item(), abs=2e-7, rel=2e-5)
 
 

@@ -59,7 +59,7 @@ def score_hindsight(model, tok, records, a):
     """Return sparse H\\C IDs (or H hidden states for the OPSD control)."""
     if not records:
         return []
-    if a.method not in ('ren_opd', 'ren_weighted_opd', 'union_topk', 'causal_topk', 'opsd', 'vanilla_opd'):
+    if a.method not in ('ren_opd', 'ren_graft', 'union_topk', 'causal_topk', 'opsd', 'vanilla_opd'):
         raise ValueError(f'Unsupported hindsight method: {a.method}')
     head = base_model(model).get_output_embeddings()
     k, vocabulary_size = min(a.top_k, head.weight.shape[0]), head.weight.shape[0]
@@ -72,7 +72,7 @@ def score_hindsight(model, tok, records, a):
             raise ValueError('Selected reasoning position is outside the response')
         if positions != sorted(set(positions)):
             raise ValueError('Selected reasoning positions must be unique and increasing')
-        if a.method in ('ren_opd', 'union_topk', 'causal_topk'):
+        if a.method in ('ren_graft', 'union_topk', 'causal_topk'):
             causal.append(_causal_ids(record, k, vocabulary_size))
     if a.method == 'vanilla_opd':
         return [{} for _ in records]
@@ -86,16 +86,15 @@ def score_hindsight(model, tok, records, a):
             if a.method == 'opsd':
                 results.append({'student_hidden': h.detach().cpu().clone()})
                 continue
-            if a.method == 'ren_weighted_opd':
-                chunks = []
+            chunks = []
+            if a.method == 'ren_opd':
                 for position in range(0, h.shape[0], a.logit_chunk_size):
-                    chunks.append(head(h[position:position + a.logit_chunk_size]).float()
-                                  .topk(k, dim=-1).indices.cpu())
+                    hs = head(h[position:position + a.logit_chunk_size]).float().topk(k, dim=-1).indices
+                    chunks.append(hs.cpu())
                 results.append({'recognition_ids': torch.cat(chunks) if chunks else
                                 torch.empty((0, k), dtype=torch.long)})
                 continue
             cs = causal[start + offset]
-            chunks = []
             for position in range(0, h.shape[0], a.logit_chunk_size):
                 hs = head(h[position:position + a.logit_chunk_size]).float().topk(k, dim=-1).indices
                 c = cs[position:position + len(hs)].to(hs.device)

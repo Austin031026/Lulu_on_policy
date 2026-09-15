@@ -32,7 +32,7 @@ from lulu.objective import (build_cached_target, forward_kl, probability_mass_at
                             recognition_weighted_forward_kl)
 from lulu.paths import PROJECT_ROOT
 
-METHODS = ('ren_opd', 'ren_weighted_opd', 'vanilla_opd', 'opsd', 'causal_topk', 'union_topk')
+METHODS = ('ren_opd', 'ren_graft', 'vanilla_opd', 'opsd', 'causal_topk', 'union_topk')
 
 
 def parser():
@@ -68,8 +68,6 @@ def parser():
     p.add_argument('--learning-rate', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=0.0)
     p.add_argument('--max-grad-norm', type=float, default=1.0)
-    p.add_argument('--pointwise-kl-clip', type=float, default=0.05,
-                   help='Cap each vocabulary-level forward-KL contribution before summing; 0 disables')
     p.add_argument('--lora-rank', type=int, default=16, help='0 for full parameter training')
     p.add_argument('--lora-alpha', type=int, default=32)
     p.add_argument('--lora-target-modules', default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
@@ -100,8 +98,6 @@ def validate_args(a):
         raise ValueError('Require temperature > 0 and 0 < top_p <= 1')
     if a.lora_rank < 0 or a.teacher_workers < 0 or a.learning_rate <= 0:
         raise ValueError('Invalid LoRA rank, teacher worker count or learning rate')
-    if a.pointwise_kl_clip < 0:
-        raise ValueError('pointwise_kl_clip must be nonnegative; 0 disables clipping')
     unsupported_heads = {'lm_head', 'embed_tokens', 'embed_in', 'embed_out', 'wte',
                          'word_embeddings', 'tok_embeddings', 'embeddings'}
     targets = {name.strip().rsplit('.', 1)[-1] for name in a.lora_target_modules.split(',')}
@@ -361,19 +357,18 @@ def collect_phase(a):
             scored = records[score_start:score_start+a.score_batch_size]
             with torch.inference_mode():
                 causal = selected_hidden(model, tok, scored, 'causal_prompt_ids', a)
-                need_h = a.method in ('ren_opd', 'ren_weighted_opd', 'opsd', 'union_topk')
+                need_h = a.method in ('ren_opd', 'ren_graft', 'opsd', 'union_topk')
                 hindsight = selected_hidden(model, tok, scored, 'hindsight_prompt_ids', a) if need_h else [None]*len(scored)
                 head = base_model(model).get_output_embeddings()
                 for record, c, h in zip(scored, causal, hindsight):
                     record['student_hidden'] = (h if a.method == 'opsd' else c).cpu()
-                    if a.method == 'ren_weighted_opd':
+                    if a.method == 'ren_opd':
                         recognition = []
                         k = min(a.top_k, head.weight.shape[0])
                         for pos in range(0, h.shape[0], a.logit_chunk_size):
-                            recognition.append(
-                                head(h[pos:pos+a.logit_chunk_size]).float().topk(k, dim=-1).indices.cpu())
-                        record['recognition_ids'] = (torch.cat(recognition) if recognition else
-                                                     torch.empty((0, k), dtype=torch.long))
+                            hs = head(h[pos:pos+a.logit_chunk_size]).float().topk(k, dim=-1).indices
+                            recognition.append(hs.cpu())
+                        record['recognition_ids'] = torch.cat(recognition) if recognition else torch.empty((0, k), dtype=torch.long)
                     elif a.method not in ('vanilla_opd', 'opsd'):
                         all_ids, all_causal_probs = [], []
                         k = min(a.top_k, head.weight.shape[0])
@@ -421,7 +416,7 @@ def teacher_phase(a):
     state = load_tensor_file(cache / 'student_head.pt')
     check_vocab(student_tok, teacher_tok, state['weight'].shape[0], teacher.get_output_embeddings().weight.shape[0])
     del state
-    if a.method in ('vanilla_opd', 'ren_weighted_opd') and a.worker_rank == 0:
+    if a.method in ('vanilla_opd', 'ren_opd') and a.worker_rank == 0:
         atomic_torch(cache / 'teacher_head.pt', head_state(teacher))
     files = sorted(cache.glob('rollout_*.pt'))[a.worker_rank::a.worker_world]
     head = teacher.get_output_embeddings()
@@ -431,7 +426,9 @@ def teacher_phase(a):
         with torch.inference_mode():
             hidden = selected_hidden(teacher, student_tok, records, 'causal_prompt_ids', a)
             for record, h, path in zip(records, hidden, batch_files):
-                if a.method in ('vanilla_opd', 'ren_weighted_opd'):
+                if a.method in ('vanilla_opd', 'ren_opd'):
+                    # ReN combines answer-blind Teacher hidden states with the
+                    # locally cached hindsight Top-K only during Student update.
                     record['teacher_hidden'] = h.cpu()
                 else:
                     probabilities = []
@@ -441,14 +438,14 @@ def teacher_phase(a):
                         logp = logits.gather(-1, ids.clamp_min(0)) - logits.logsumexp(-1, keepdim=True)
                         probabilities.append(logp.exp().masked_fill(ids < 0, 0).cpu())
                     record['teacher_probs'] = torch.cat(probabilities) if probabilities else torch.empty_like(record['correction_ids'], dtype=torch.float32)
-                if a.method not in ('vanilla_opd', 'ren_weighted_opd', 'opsd'):
-                    positive = (record['teacher_probs'] > record['causal_candidate_probs']) & (record['correction_ids'] >= 0)
-                    record['diagnostics'] = {
-                        'frontier_actions': int((record['correction_ids'] >= 0).sum()),
-                        'positive_corrections': int(positive.sum()),
-                        'corrected_positions': int(positive.any(-1).sum()),
-                        'added_mass_sum': float((record['teacher_probs'] - record['causal_candidate_probs']).clamp_min(0).sum()),
-                    }
+                    if a.method != 'opsd':
+                        positive = (record['teacher_probs'] > record['causal_candidate_probs']) & (record['correction_ids'] >= 0)
+                        record['diagnostics'] = {
+                            'frontier_actions': int((record['correction_ids'] >= 0).sum()),
+                            'positive_corrections': int(positive.sum()),
+                            'corrected_positions': int(positive.any(-1).sum()),
+                            'added_mass_sum': float((record['teacher_probs'] - record['causal_candidate_probs']).clamp_min(0).sum()),
+                        }
                 record['teacher_scored'] = True
                 atomic_torch(path, record)
         print(json.dumps({'phase': 'teacher', 'worker': a.worker_rank, 'done': min(start+a.score_batch_size, len(files)),
@@ -482,21 +479,18 @@ class DistillationStep(nn.Module):
                 probs = probs[start:end].to(hs.device) if probs is not None else None
                 th = r.get('teacher_hidden')
                 th = th[start:end].to(hs.device) if th is not None else None
-
                 recognition_ids = r.get('recognition_ids')
                 recognition_ids = recognition_ids[start:end].to(hs.device) if recognition_ids is not None else None
 
                 def chunk_loss(live, frozen, ids, probs, th, recognition_ids):
-                    clip = getattr(a, 'pointwise_kl_clip', None) or None
                     causal_logits = self.frozen_head(frozen)
                     live_logits = head(live)
-                    if a.method == 'ren_weighted_opd':
+                    if a.method == 'ren_opd':
                         teacher_logits = self.teacher_head(th)
                         with torch.no_grad():
                             recognition_mass = probability_mass_at_ids(teacher_logits, recognition_ids)
                         return recognition_weighted_forward_kl(
-                            live_logits, causal_logits, teacher_logits, recognition_mass,
-                            reduction='none', pointwise_clip=clip).sum()
+                            live_logits, causal_logits, teacher_logits, recognition_mass, reduction='none').sum()
                     with torch.no_grad():
                         if a.method == 'vanilla_opd':
                             target = self.teacher_head(th).float().softmax(-1)
@@ -504,11 +498,10 @@ class DistillationStep(nn.Module):
                             target = causal_logits.float().softmax(-1)
                         else:
                             target = build_cached_target(causal_logits, ids, probs, method=a.method)
-                    return forward_kl(live_logits, target, reduction='none', pointwise_clip=clip).sum()
+                    return forward_kl(live_logits, target, reduction='none').sum()
 
                 value = checkpoint(chunk_loss, hs[start:end], frozen, ids, probs, th, recognition_ids,
-                                   use_reentrant=False) if a.gradient_checkpointing else chunk_loss(
-                                       hs[start:end], frozen, ids, probs, th, recognition_ids)
+                                   use_reentrant=False) if a.gradient_checkpointing else chunk_loss(hs[start:end], frozen, ids, probs, th, recognition_ids)
                 total = total + value / n
         return total
 
@@ -526,7 +519,7 @@ def update_phase(a):
         raise RuntimeError(f'Incomplete round: {len(files)} rollouts, expected {expected}')
     student, tok = load_student(a, current, trainable=True), load_tokenizer(a.model)
     frozen_head = load_head(cache / 'student_head.pt', device)
-    teacher_head = load_head(cache / 'teacher_head.pt', device) if a.method in ('vanilla_opd', 'ren_weighted_opd') else None
+    teacher_head = load_head(cache / 'teacher_head.pt', device) if a.method in ('vanilla_opd', 'ren_opd') else None
     step_model = DistillationStep(student, frozen_head, teacher_head, tok, a)
     optimizer = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad],
                                  lr=a.learning_rate, weight_decay=a.weight_decay)
@@ -589,7 +582,9 @@ def update_phase(a):
         if not torch.isfinite(loss_sum):
             raise FloatingPointError('Non-finite distillation loss')
         optimizer.step()
-        entry = {'round': a.round, 'update': update, 'forward_kl': loss_sum.item()/total_active,
+        objective_value = loss_sum.item()/total_active
+        entry = {'round': a.round, 'update': update, 'objective_loss': objective_value,
+                 'forward_kl': objective_value,  # legacy field name kept for older analysis scripts
                  'grad_norm': grad_norm.item(), 'reasoning_tokens': total_positions,
                  'trajectories': expected, 'supervised_trajectories': total_active, 'seconds': time.monotonic()-started,
                  **dict(zip(diagnostic_keys, diagnostic_totals.tolist()))}

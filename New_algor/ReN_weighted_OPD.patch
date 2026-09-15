@@ -1,0 +1,1099 @@
+diff --git a/README.md b/README.md
+index 2746b96..d632eee 100644
+--- a/README.md
++++ b/README.md
+@@ -19,23 +19,25 @@ Rona_LuLu/
+ 
+ ## 算法与边界
+ 
+-设本轮冻结快照为 S_r，所有 response IDs 来自 S_r 的采样。对每个 reasoning token 的同一个 sampled prefix：
++设本轮冻结快照为 $S_r$，所有 response IDs 都由 $S_r$ 自己采样，因此训练 state 严格来自当前 Student policy。对每个 reasoning token 的同一个 sampled prefix：
+ 
+ ```
+ pC = S_r(causal prompt + sampled response prefix)
+ pH = S_r(hindsight prompt + exact same sampled response prefix)
+-qT = external Teacher(causal prompt + sampled response prefix)
+-R  = TopK(pH) minus TopK(pC)
+-q_hat[a] = qT[a]  if a in R and qT[a] > pC[a], else pC[a]
+-target = q_hat / sum(q_hat)
+-loss = KL(stop_gradient(target) || trainable Student)
++qT = answer-blind external Teacher(causal prompt + sampled response prefix)
++H  = TopK(pH)
++alpha = sum_{a in H} qT[a]
++loss_t = alpha * KL(stopgrad(qT) || p_theta)
++       + (1-alpha) * KL(stopgrad(pC) || p_theta)
+ ```
+ 
++这是当前 `ren_opd` 的核心：**preserve with Student, gate with hindsight, learn from Teacher**。`pH` 从不作为 target，也不再用 $H\setminus C$ 去拼一个人工 target distribution；它只通过 `alpha` 控制当前位置应当信任 external Teacher 多少。Teacher 与 frozen causal Student 的 mismatch 本身提供 novelty，Teacher 在 hindsight Top-K 上的 probability mass 提供 recognizability。当 `alpha=1` 时退化成标准 Teacher OPD；当 `alpha=0` 时只保留 round-start Student policy。
++
+ Gold outcome 只加在 hindsight user context 中，不使用 gold solution，也不进入 Student rollout、Teacher context 或 trainable Student context。缓存保留 sampled token IDs，不将轨迹重新 tokenize；预测 response token t 的 hidden index 是 `prompt_length + t - 1`。
+ 
+ ReN 只启用明确的 `<think>...</think>` reasoning span，支持 token 上限截断的未闭合 thinking；排除 thinking 标签、special/EOS、prompt，以及首次 boxed/final-answer 标记起的 remainder。无明确 thinking span 的 response 不产生 loss，整轮无 reasoning 会报错。不同模型／语言的 reasoning 协议需要相应扩展 mask。
+ 
+-每条有 reasoning 的轨迹先对 reasoning positions 取平均，再对全局有效轨迹取平均。没有 positive correction 的 position **仍保留**，target 等于 frozen pC：更新起点 KL/gradient 为零；Student 更新后，该位置可以产生回到 snapshot 的约束。它不是永远零梯度，也不是按 novelty score 加权或筛选轨迹。
++每条有 reasoning 的轨迹先对 reasoning positions 取平均，再对全局有效轨迹取平均。所有 target 均来自本轮开始时的 frozen Student / Teacher scoring 并 stop-gradient；每轮只做一次 DDP update 后立即 refresh rollout。旧的 $H\setminus C$ positive-correction graft 仍保留为 `ren_graft` ablation，便于复现负收益版本，但不再是默认 ReN。
+ 
+ 默认每轮一整个 rollout batch、一次全局 optimizer update，然后刷新快照和 rollout。常驻后端只接受 `--update-passes 1`：本轮全部轨迹和 target 准备完成后才进入 DDP update，下一轮必须等待更新与 hindsight 权重同步完成。优化器状态跨 round 常驻；断点续训从完整 checkpoint 恢复，未完成 round 重新采样、评分。旧的 `--backend staged` 仍支持多次 update-passes，但后续更新使用的是本轮旧快照采样的轨迹。
+ 
+@@ -53,7 +55,7 @@ ReN 只启用明确的 `<think>...</think>` reasoning span，支持 token 上限
+ 
+ 同一轮内，Student 按 batch 流式提交已采样轨迹；hindsight 为较早的 batch 计算 recognition frontier 时，其他 Student batch 可以继续采样，Teacher 随后为已完成 frontier 的 batch 评分。全部 batch 完成后进行一次 DDP update。**流水线只在同一份冻结快照的 round 内重叠，不提前用旧权重采样下一轮。**
+ 
+-Frozen hidden states 留在各 Student 进程内存中，稀疏 Teacher probabilities 经进程间通信返回，不写读 round cache 文件，也不在每轮重新加载模型。背景分布仍在 update 中按 `--logit-chunk-size` 重建，Teacher 概率使用完整词表归一化；不保存 `[所有 tokens, vocabulary]` target，也不采用 Top-K 内重新 softmax 的近似。投影和 KL 一起做 activation checkpointing。
++Frozen causal hidden states 留在各 Student 进程内存中。默认 `ren_opd` 中，hindsight 服务只把 Top-K token IDs 返回给 Student/controller；这些 gold-dependent IDs **不会发送给 Teacher**。Teacher 服务只接收 causal prompt + Student sampled prefix，并返回 answer-blind Teacher selected hidden states。Teacher output head 在启动时只传一次到 Student worker；update 端按 `--logit-chunk-size` 重建 full-vocabulary $q_T$，再用本地 hindsight Top-K 计算 $\alpha=q_T(\mathrm{TopK}(p_H))$。因此 Teacher 始终严格 answer-blind，也不需要传输或保存 `[所有 tokens, vocabulary]` logits。`ren_graft` / Top-K projection controls 仍走原来的稀疏 Teacher probability 路径。
+ 
+ `--student-gpus`、`--hindsight-gpus`、`--teacher-gpus` 可显式分配互不重叠的组；不指定时从 `--gpus` 中自动分配，默认保留 2 卡给 Teacher、1 卡给 hindsight，其余给 Student。`--teacher-gpus-per-worker` 控制自动分配的 Teacher TP 大小，显式 `--teacher-gpus` 则直接决定 TP 大小；常驻后端只有一个 Teacher 实例。`opsd` 不启动 Teacher，`vanilla_opd` / `causal_topk` 不启动 hindsight，未使用角色应保持 GPU 参数为 `auto`。
+ 
+@@ -132,15 +134,16 @@ Qwen3-32B 未在本机已检查的 cache 中，需要先提供其本地路径／
+ 
+ 相同代码、rollout refresh、随机种子、batch 与 reasoning mask：
+ 
+-| `--method` | Target |
++| `--method` | Supervision |
+ | --- | --- |
+-| `ren_opd`（默认） | pC background + positive Teacher corrections on H minus C |
++| `ren_opd`（默认） | `alpha KL(qT||pθ) + (1-alpha) KL(pC||pθ)`，其中 `alpha=qT(TopK(pH))` |
++| `ren_graft` | 旧版：在 `TopK(pH)\TopK(pC)` 上 graft positive Teacher corrections |
+ | `vanilla_opd` | 完整 qT |
+ | `opsd` | 完整 frozen pH，直接作为 target |
+ | `causal_topk` | qT 投影到 causal Top-K，再归一化 |
+ | `union_topk` | qT 投影到 causal/hindsight Top-K 的 union，再归一化 |
+ 
+-`union_topk` 是论文中的 projection ablation，**与主方法 graft target 不同**。这些对照共享调度与代码但各自随后从自己的 Student rollout。Base 在 evaluation 中直接评测初始化模型；Teacher trajectory SFT/SeqKD 不属于此 on-policy 训练入口。
++`ren_graft` 是此前负收益目标的复现/消融；默认 `ren_opd` 不再修改 Teacher distribution 的 support，而是由 hindsight recognition 决定 Teacher-vs-Student-preservation 的连续权重。这些对照共享 rollout refresh、reasoning mask 与 optimizer 配置，但各自随后从自己的 Student rollout。Base 在 evaluation 中直接评测初始化模型；Teacher trajectory SFT/SeqKD 不属于此 on-policy 训练入口。
+ 
+ ## Evaluation
+ 
+diff --git a/lulu/hindsight_service.py b/lulu/hindsight_service.py
+index d95d845..d0ed428 100644
+--- a/lulu/hindsight_service.py
++++ b/lulu/hindsight_service.py
+@@ -59,7 +59,7 @@ def score_hindsight(model, tok, records, a):
+     """Return sparse H\\C IDs (or H hidden states for the OPSD control)."""
+     if not records:
+         return []
+-    if a.method not in ('ren_opd', 'union_topk', 'causal_topk', 'opsd', 'vanilla_opd'):
++    if a.method not in ('ren_opd', 'ren_graft', 'union_topk', 'causal_topk', 'opsd', 'vanilla_opd'):
+         raise ValueError(f'Unsupported hindsight method: {a.method}')
+     head = base_model(model).get_output_embeddings()
+     k, vocabulary_size = min(a.top_k, head.weight.shape[0]), head.weight.shape[0]
+@@ -72,7 +72,7 @@ def score_hindsight(model, tok, records, a):
+             raise ValueError('Selected reasoning position is outside the response')
+         if positions != sorted(set(positions)):
+             raise ValueError('Selected reasoning positions must be unique and increasing')
+-        if a.method in ('ren_opd', 'union_topk', 'causal_topk'):
++        if a.method in ('ren_graft', 'union_topk', 'causal_topk'):
+             causal.append(_causal_ids(record, k, vocabulary_size))
+     if a.method == 'vanilla_opd':
+         return [{} for _ in records]
+@@ -86,8 +86,15 @@ def score_hindsight(model, tok, records, a):
+             if a.method == 'opsd':
+                 results.append({'student_hidden': h.detach().cpu().clone()})
+                 continue
+-            cs = causal[start + offset]
+             chunks = []
++            if a.method == 'ren_opd':
++                for position in range(0, h.shape[0], a.logit_chunk_size):
++                    hs = head(h[position:position + a.logit_chunk_size]).float().topk(k, dim=-1).indices
++                    chunks.append(hs.cpu())
++                results.append({'recognition_ids': torch.cat(chunks) if chunks else
++                                torch.empty((0, k), dtype=torch.long)})
++                continue
++            cs = causal[start + offset]
+             for position in range(0, h.shape[0], a.logit_chunk_size):
+                 hs = head(h[position:position + a.logit_chunk_size]).float().topk(k, dim=-1).indices
+                 c = cs[position:position + len(hs)].to(hs.device)
+diff --git a/lulu/objective.py b/lulu/objective.py
+index 9f298d4..049c153 100644
+--- a/lulu/objective.py
++++ b/lulu/objective.py
+@@ -1,16 +1,29 @@
+-"""Stopped full-vocabulary targets for Lulu / ReN on-policy distillation.
+-
+-``ren_opd`` grafts *positive* external-teacher corrections in H \\ C onto
+-the frozen causal student distribution, then normalizes over the whole
+-vocabulary. Hindsight probabilities never serve as target values in this mode.
+-No score weights the loss, and states without a correction retain their frozen
+-causal target (which can still regularize drift later in a training round).
+-
+-The functions accept arbitrary leading position dimensions. Call them on small
+-position chunks after vocabulary projection to bound peak memory; no function
+-below stores a trajectory-sized vocabulary tensor internally or constructs a
+-dense frontier mask. The caller is responsible for supplying distributions from
+-the same frozen snapshot and masking reasoning positions, excluding answers.
++"""Objectives for LuLu / ReN on-policy distillation.
++
++The current ``ren_opd`` objective deliberately does *not* construct supervision
++from ``p_H - p_C`` and does not splice selected Teacher probabilities into the
++Student distribution.  Instead the three frozen views have separate roles:
++
++* ``p_C`` (causal Student snapshot) is the policy-preservation anchor;
++* ``p_H`` (same Student + gold outcome) defines recognition only;
++* ``q_T`` (answer-blind external Teacher) is the knowledge source.
++
++For each reasoning position we compute the Teacher probability mass on the
++hindsight Student's Top-K actions,
++
++    alpha_t = q_T(TopK(p_H)).
++
++The trainable Student then minimizes
++
++    alpha_t KL(q_T || p_theta) + (1-alpha_t) KL(p_C || p_theta).
++
++Thus hindsight never becomes a target distribution.  It only controls how much
++we trust the external Teacher; low-recognition positions stay close to the
++on-policy Student snapshot.  ``ren_graft`` retains the previous H\\C positive-
++correction target as an explicit legacy/ablation mode.
++
++All functions accept arbitrary leading position dimensions.  Dense vocabulary
++math should be called in small position chunks to bound peak memory.
+ """
+ from __future__ import annotations
+ 
+@@ -18,7 +31,7 @@ import torch
+ from torch.nn import functional as F
+ 
+ 
+-METHODS = ("ren_opd", "vanilla_opd", "opsd", "causal_topk", "union_topk")
++METHODS = ("ren_opd", "ren_graft", "vanilla_opd", "opsd", "causal_topk", "union_topk")
+ 
+ 
+ def _math_dtype(*values: torch.Tensor | None) -> torch.dtype:
+@@ -36,13 +49,43 @@ def _check_source(source: torch.Tensor | None, causal: torch.Tensor, name: str)
+ 
+ 
+ def _novel_indices(hindsight_ids: torch.Tensor, causal_ids: torch.Tensor) -> torch.Tensor:
+-    """Membership in H \\ C using O(positions * K) memory, not a K² comparison."""
++    """Membership in H \\ C using O(positions * K) memory, not a K² mask."""
+     ordered = causal_ids.sort(dim=-1).values.contiguous()
+     where = torch.searchsorted(ordered, hindsight_ids.contiguous())
+     found = ordered.gather(-1, where.clamp_max(ordered.shape[-1] - 1))
+     return (where == ordered.shape[-1]) | (found != hindsight_ids)
+ 
+ 
++@torch.no_grad()
++def probability_mass_at_ids(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
++    """Exact full-vocabulary probability mass at ``ids``.
++
++    ``logits`` has shape ``[..., V]`` and ``ids`` shape ``[..., K]`` with the
++    same leading dimensions.  ``-1`` may pad IDs and contributes zero mass.
++    The returned tensor has shape ``[...]`` and is detached FP32/FP64.
++    """
++    if logits.ndim < 2 or not logits.is_floating_point():
++        raise ValueError("logits must be floating-point [..., vocabulary]")
++    if ids.dtype != torch.long or ids.shape[:-1] != logits.shape[:-1] or ids.device != logits.device:
++        raise ValueError("ids must be torch.long [..., K] on the same device with matching leading dimensions")
++    vocab = logits.shape[-1]
++    valid = ids >= 0
++    if bool((ids < -1).any()) or bool((ids[valid] >= vocab).any()):
++        raise ValueError("ids must be -1 padding or valid vocabulary IDs")
++    dtype = _math_dtype(logits)
++    math_logits = logits.detach().to(dtype)
++    safe = ids.clamp_min(0)
++    selected_logp = math_logits.gather(-1, safe) - math_logits.logsumexp(-1, keepdim=True)
++    mass = selected_logp.exp().masked_fill(~valid, 0.0).sum(-1)
++    # Repeated IDs would double-count probability mass and invalidate alpha.
++    if ids.shape[-1] > 1:
++        sorted_ids = ids.masked_fill(~valid, vocab).sort(dim=-1).values
++        dup = (sorted_ids[..., 1:] == sorted_ids[..., :-1]) & (sorted_ids[..., 1:] != vocab)
++        if bool(dup.any()):
++            raise ValueError("ids must be unique within each position")
++    return mass.clamp(0.0, 1.0)
++
++
+ @torch.no_grad()
+ def build_target(
+     causal_logits: torch.Tensor,
+@@ -53,23 +96,24 @@ def build_target(
+     *,
+     return_diagnostics: bool = False,
+ ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+-    """Construct a detached probability target of shape ``[..., vocabulary]``.
+-
+-    Methods:
+-      * ``ren_opd``: qhat[a] = qT[a] iff a ∈ TopK(pH) \\ TopK(pC) and
+-        qT[a] > pC[a], otherwise qhat[a] = pC[a]; return qhat / sum(qhat).
+-      * ``vanilla_opd``: the external teacher's full probability distribution.
+-      * ``opsd``: the frozen hindsight student's full probability distribution.
+-      * ``causal_topk``: qT projected onto TopK(pC), then renormalized.
+-      * ``union_topk``: qT projected onto TopK(pC) ∪ TopK(pH), renormalized.
+-
+-    The last two are support-projection controls, distinct from ReN grafting.
+-    ``top_k`` must be positive and is capped at vocabulary size. Rank selection
+-    uses the supplied logits directly; all normalization uses FP32 (FP64 if an
+-    input is FP64). Inputs must be finite model logits. None is accepted for
+-    hindsight/teacher only when the selected baseline does not use that source.
+-
+-    Optional diagnostics have shape ``[...]``; no diagnostic changes the loss.
++    """Construct detached dense targets for reference/tests and baselines.
++
++    ``ren_opd`` returns the convex target
++
++        m_t = alpha_t q_T + (1-alpha_t) p_C,
++        alpha_t = q_T(TopK(p_H)).
++
++    Optimizing ``KL(m_t || p_theta)`` has the same gradient w.r.t. Student
++    logits as the production weighted objective
++
++        alpha KL(q_T||p_theta) + (1-alpha) KL(p_C||p_theta),
++
++    but production uses the latter so logged losses preserve the two-term
++    interpretation.  Hindsight values never enter the target except through
++    the Top-K support used to compute alpha.
++
++    ``ren_graft`` is the previous ReN target: positive Teacher corrections on
++    TopK(p_H)\\TopK(p_C) grafted into p_C and renormalized.
+     """
+     if method not in METHODS:
+         raise ValueError(f"unknown method={method!r}; expected one of {METHODS}")
+@@ -78,7 +122,7 @@ def build_target(
+     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+         raise ValueError("top_k must be a positive integer")
+     causal = causal_logits.detach()
+-    hindsight = _check_source(hindsight_logits, causal, "hindsight_logits") if method in {"ren_opd", "opsd", "union_topk"} else None
++    hindsight = _check_source(hindsight_logits, causal, "hindsight_logits") if method in {"ren_opd", "ren_graft", "opsd", "union_topk"} else None
+     teacher = _check_source(teacher_logits, causal, "teacher_logits") if method != "opsd" else None
+     dtype = _math_dtype(causal, hindsight, teacher)
+     k = min(top_k, causal.shape[-1])
+@@ -86,15 +130,27 @@ def build_target(
+ 
+     if method == "vanilla_opd":
+         target_logp = F.log_softmax(teacher.to(dtype), dim=-1)
++        target = target_logp.exp()
+     elif method == "opsd":
+         target_logp = F.log_softmax(hindsight.to(dtype), dim=-1)
++        target = target_logp.exp()
++    elif method == "ren_opd":
++        causal_probs = F.softmax(causal.to(dtype), dim=-1)
++        teacher_probs = F.softmax(teacher.to(dtype), dim=-1)
++        hindsight_ids = hindsight.topk(k, dim=-1, sorted=False).indices
++        alpha = teacher_probs.gather(-1, hindsight_ids).sum(-1).clamp(0.0, 1.0)
++        target = alpha.unsqueeze(-1) * teacher_probs + (1.0 - alpha).unsqueeze(-1) * causal_probs
++        target_logp = target.log()
++        if return_diagnostics:
++            teacher_kl_causal = (teacher_probs * (F.log_softmax(teacher.to(dtype), -1) - F.log_softmax(causal.to(dtype), -1))).sum(-1)
++            stats.update(recognition_mass=alpha, teacher_causal_kl=teacher_kl_causal)
+     else:
+         causal_ids = causal.topk(k, dim=-1, sorted=False).indices
+         if method == "causal_topk":
+-            # Global teacher log-normalization cancels under the projection.
+             target_logits = torch.full_like(causal, -torch.inf, dtype=dtype)
+             target_logits.scatter_(-1, causal_ids, teacher.gather(-1, causal_ids).to(dtype))
+             target_logp = F.log_softmax(target_logits, dim=-1)
++            target = target_logp.exp()
+         else:
+             hindsight_ids = hindsight.topk(k, dim=-1, sorted=False).indices
+             novelty = _novel_indices(hindsight_ids, causal_ids)
+@@ -103,10 +159,9 @@ def build_target(
+                 target_logits.scatter_(-1, causal_ids, teacher.gather(-1, causal_ids).to(dtype))
+                 target_logits.scatter_(-1, hindsight_ids, teacher.gather(-1, hindsight_ids).to(dtype))
+                 target_logp = F.log_softmax(target_logits, dim=-1)
+-            else:
++                target = target_logp.exp()
++            else:  # legacy ren_graft
+                 causal_logp = F.log_softmax(causal.to(dtype), dim=-1)
+-                # Only K teacher probabilities are needed, but their normalizer
+-                # must cover the full vocabulary to compare qT[a] with pC[a].
+                 teacher_math = teacher.to(dtype)
+                 teacher_h_logp = teacher_math.gather(-1, hindsight_ids) - teacher_math.logsumexp(-1, keepdim=True)
+                 causal_h_logp = causal_logp.gather(-1, hindsight_ids)
+@@ -115,53 +170,43 @@ def build_target(
+                 target_logits = causal_logp.clone()
+                 target_logits.scatter_(-1, hindsight_ids, replacement)
+                 target_logp = F.log_softmax(target_logits, dim=-1)
++                target = target_logp.exp()
+                 if return_diagnostics:
+                     teacher_h = teacher_h_logp.exp()
+                     causal_h = causal_h_logp.exp()
+-                    stats = {
+-                        "novelty_count": novelty.sum(-1),
+-                        "correction_count": correction.sum(-1),
+-                        "added_mass": torch.where(correction, teacher_h - causal_h, 0.0).sum(-1),
+-                        "teacher_mass_in_region": torch.where(novelty, teacher_h, 0.0).sum(-1),
+-                        "causal_mass_in_region": torch.where(novelty, causal_h, 0.0).sum(-1),
+-                    }
+-
+-    target = target_logp.exp()
++                    stats.update(
++                        novelty_count=novelty.sum(-1),
++                        correction_count=correction.sum(-1),
++                        added_mass=torch.where(correction, teacher_h - causal_h, 0.0).sum(-1),
++                        teacher_mass_in_region=torch.where(novelty, teacher_h, 0.0).sum(-1),
++                        causal_mass_in_region=torch.where(novelty, causal_h, 0.0).sum(-1),
++                    )
++
+     if return_diagnostics:
+-        # Replace -inf at zero-probability projection entries before multiplying.
+-        stats["target_entropy"] = -(target * target_logp.masked_fill(target == 0, 0.0)).sum(-1)
++        safe_log = target_logp.masked_fill(target == 0, 0.0)
++        stats["target_entropy"] = -(target * safe_log).sum(-1)
+         return target, stats
+     return target
+ 
+ 
+-
+ @torch.no_grad()
+ def build_cached_target(
+     causal_logits: torch.Tensor,
+     correction_ids: torch.Tensor,
+     teacher_probs: torch.Tensor,
+     *,
+-    method: str = "ren_opd",
++    method: str = "ren_graft",
+     return_diagnostics: bool = False,
+ ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+-    """Reconstruct an exact target from sparse, frozen teacher scoring results.
+-
+-    ``causal_logits`` are the frozen round-start student's full-vocabulary
+-    logits. ``correction_ids`` and ``teacher_probs`` have shape ``[..., K]``
+-    with the same leading dimensions; -1 IDs pad shorter supports, with their
+-    probabilities ignored. Nonpadding IDs must be unique within each position.
+-    For ReN, IDs must have already been restricted to H \\ C. Probabilities
+-    are qT at those IDs, normalized by the teacher's *whole* vocabulary, never
+-    by the sparse candidate set. Positive corrections are checked again here.
+-
+-    For ``causal_topk`` and ``union_topk``, IDs instead contain the projected
+-    support and probabilities are renormalized over that support. At least one
+-    nonzero support entry is required per position in those projection modes.
+-    This representation avoids retaining or transferring dense teacher logits
+-    during the optimizer passes, while preserving the exact ReN background.
++    """Reconstruct legacy sparse targets from cached exact Teacher probabilities.
++
++    New ``ren_opd`` intentionally does not use this sparse target path because
++    its objective needs the full Teacher distribution plus a scalar recognition
++    weight.  This function remains for ``ren_graft`` and Top-K projection
++    controls.
+     """
+-    if method not in {"ren_opd", "causal_topk", "union_topk"}:
+-        raise ValueError("cached targets support ren_opd, causal_topk, and union_topk")
++    if method not in {"ren_graft", "causal_topk", "union_topk"}:
++        raise ValueError("cached targets support ren_graft, causal_topk, and union_topk")
+     if causal_logits.ndim < 2 or not causal_logits.is_floating_point():
+         raise ValueError("causal_logits must be floating-point [..., vocabulary]")
+     if correction_ids.shape != teacher_probs.shape or correction_ids.shape[:-1] != causal_logits.shape[:-1]:
+@@ -173,15 +218,12 @@ def build_cached_target(
+     dtype = _math_dtype(causal_logits, teacher_probs)
+     probabilities = teacher_probs.detach().to(dtype)
+     vocab_size = causal_logits.shape[-1]
+-    # A private padding column prevents padded -1 entries from overwriting a
+-    # legitimate token-0 correction during scatter. Invalid other IDs naturally
+-    # raise an indexing error instead of being silently clamped.
+     ids = torch.where(correction_ids == -1, vocab_size, correction_ids)
+     valid = correction_ids != -1
+     shape = (*causal_logits.shape[:-1], vocab_size + 1)
+     scratch = torch.zeros(shape, dtype=dtype, device=causal_logits.device)
+     stats: dict[str, torch.Tensor] = {}
+-    if method == "ren_opd":
++    if method == "ren_graft":
+         scratch[..., :vocab_size] = F.softmax(causal_logits.detach().to(dtype), dim=-1)
+         causal_at_ids = scratch.gather(-1, ids)
+         positive = valid & (probabilities > causal_at_ids)
+@@ -210,16 +252,7 @@ def reduce_position_losses(
+     reduction: str = "sequence_mean",
+     sequence_ids: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """Reduce token losses, giving each nonempty sequence equal weight.
+-
+-    ``none`` returns masked position losses, ``sum`` their sum, ``token_mean``
+-    their mean over valid positions, and ``sequence_mean`` the mean of each
+-    sequence's valid-position mean. A [B,T] tensor uses its first dimension as
+-    sequence index; a [T] tensor denotes one sequence unless ``sequence_ids``
+-    supplies nonnegative integer sequence indices of the same shape. Empty
+-    sequences are excluded, and an entirely masked batch returns a connected
+-    zero with zero gradients. Mask must be boolean; it never acts as a weight.
+-    """
++    """Reduce token losses, giving each nonempty sequence equal weight."""
+     if reduction not in {"none", "sum", "token_mean", "sequence_mean"}:
+         raise ValueError(f"unknown reduction={reduction!r}")
+     if losses.ndim < 1:
+@@ -242,7 +275,6 @@ def reduce_position_losses(
+             raise ValueError("sequence_ids must be torch.long and match the loss shape and device")
+         if sequence_ids.numel() and bool((sequence_ids < 0).any()):
+             raise ValueError("sequence_ids must be nonnegative")
+-        # Unique indices allow sparse/global sequence IDs without huge buffers.
+         unique_ids, inverse = torch.unique(sequence_ids.reshape(-1), return_inverse=True)
+         sums = losses.new_zeros(unique_ids.numel()).scatter_add(0, inverse, selected.reshape(-1))
+         counts = losses.new_zeros(unique_ids.numel()).scatter_add(0, inverse, valid.reshape(-1).to(losses.dtype))
+@@ -255,6 +287,13 @@ def reduce_position_losses(
+     return (sums / counts.clamp_min(1)).sum() / nonempty.sum().clamp_min(1)
+ 
+ 
++def _position_forward_kl(student_logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
++    dtype = _math_dtype(student_logits, target_probs)
++    target = target_probs.detach().to(dtype)
++    log_student = F.log_softmax(student_logits.to(dtype), dim=-1)
++    return (torch.xlogy(target, target) - target * log_student).sum(-1)
++
++
+ def forward_kl(
+     student_logits: torch.Tensor,
+     target_probs: torch.Tensor,
+@@ -263,22 +302,62 @@ def forward_kl(
+     reduction: str = "sequence_mean",
+     sequence_ids: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+-    """Compute KL(stopgrad(target) || student), differentiating only the student.
+-
+-    ``target_probs`` must already be a normalized probability distribution.
+-    The reduction follows the per-sequence reasoning-position mean in ReN's
+-    objective. Use ``reduction='none'`` when accumulating projected chunks with
+-    sequence weights outside this function. Zero target entries are supported.
+-    """
++    """Compute KL(stopgrad(target) || student), differentiating only Student."""
+     if student_logits.ndim < 2 or student_logits.shape != target_probs.shape:
+         raise ValueError("student_logits and target_probs must have identical [..., vocabulary] shapes")
+     if student_logits.device != target_probs.device:
+         raise ValueError("student_logits and target_probs must be on the same device")
+     if not student_logits.is_floating_point() or not target_probs.is_floating_point():
+         raise ValueError("student_logits and target_probs must be floating-point tensors")
+-    dtype = _math_dtype(student_logits, target_probs)
+-    target = target_probs.detach().to(dtype)
+-    log_student = F.log_softmax(student_logits.to(dtype), dim=-1)
+-    # xlogy defines the 0*log(0) limit without introducing epsilon mass.
+-    position_kl = (torch.xlogy(target, target) - target * log_student).sum(-1)
++    position_kl = _position_forward_kl(student_logits, target_probs)
+     return reduce_position_losses(position_kl, mask, reduction=reduction, sequence_ids=sequence_ids)
++
++
++def recognition_weighted_forward_kl(
++    student_logits: torch.Tensor,
++    causal_logits: torch.Tensor,
++    teacher_logits: torch.Tensor,
++    recognition_mass: torch.Tensor,
++    mask: torch.Tensor | None = None,
++    *,
++    reduction: str = "sequence_mean",
++    sequence_ids: torch.Tensor | None = None,
++    return_components: bool = False,
++):
++    """ReN objective: trust Teacher by recognition, otherwise preserve Student.
++
++    Per position:
++
++        alpha KL(q_T || p_theta) + (1-alpha) KL(p_C || p_theta),
++
++    where ``alpha`` is the *frozen* Teacher probability mass assigned to the
++    hindsight Student's Top-K actions.  ``p_C`` and ``q_T`` are detached; the
++    hindsight Student affects only ``alpha`` and never supplies target values.
++    """
++    if student_logits.shape != causal_logits.shape or student_logits.shape != teacher_logits.shape:
++        raise ValueError("student, causal and teacher logits must have identical [..., vocabulary] shapes")
++    if student_logits.ndim < 2 or not all(x.is_floating_point() for x in (student_logits, causal_logits, teacher_logits)):
++        raise ValueError("student, causal and teacher logits must be floating-point [..., vocabulary]")
++    if recognition_mass.shape != student_logits.shape[:-1] or recognition_mass.device != student_logits.device:
++        raise ValueError("recognition_mass must match the logits leading dimensions and device")
++    if not recognition_mass.is_floating_point():
++        raise ValueError("recognition_mass must be floating-point")
++    alpha = recognition_mass.detach().to(_math_dtype(recognition_mass, student_logits))
++    tolerance = 1e-6
++    if bool((alpha < -tolerance).any()) or bool((alpha > 1 + tolerance).any()):
++        raise ValueError("recognition_mass must lie in [0, 1]")
++    alpha = alpha.clamp(0.0, 1.0)
++    dtype = _math_dtype(student_logits, causal_logits, teacher_logits, alpha)
++    causal_probs = F.softmax(causal_logits.detach().to(dtype), dim=-1)
++    teacher_probs = F.softmax(teacher_logits.detach().to(dtype), dim=-1)
++    teacher_kl = _position_forward_kl(student_logits, teacher_probs)
++    preserve_kl = _position_forward_kl(student_logits, causal_probs)
++    position_loss = alpha * teacher_kl + (1.0 - alpha) * preserve_kl
++    loss = reduce_position_losses(position_loss, mask, reduction=reduction, sequence_ids=sequence_ids)
++    if not return_components:
++        return loss
++    return loss, {
++        "teacher_kl": reduce_position_losses(teacher_kl, mask, reduction=reduction, sequence_ids=sequence_ids),
++        "preserve_kl": reduce_position_losses(preserve_kl, mask, reduction=reduction, sequence_ids=sequence_ids),
++        "recognition_mass": reduce_position_losses(alpha, mask, reduction=reduction, sequence_ids=sequence_ids),
++    }
+diff --git a/lulu/persistent.py b/lulu/persistent.py
+index 792663c..ad9df7e 100644
+--- a/lulu/persistent.py
++++ b/lulu/persistent.py
+@@ -33,7 +33,7 @@ from lulu.checkpoints import CheckpointManager
+ 
+ 
+ def allocate_roles(a):
+-    needs_h = a.method in ('ren_opd', 'opsd', 'union_topk')
++    needs_h = a.method in ('ren_opd', 'ren_graft', 'opsd', 'union_topk')
+     needs_t = a.method != 'opsd'
+     if a.cpu:
+         return {'student': [], 'hindsight': [] if needs_h else None,
+@@ -144,7 +144,7 @@ def collect_batches(student, tok, rows, a, rank, world):
+                         r['student_hidden'] = h.detach().to('cpu', copy=True)
+                     payload = {key: r[key] for key in ('index', 'causal_prompt_ids',
+                                'hindsight_prompt_ids', 'response_ids', 'positions')}
+-                    if a.method not in ('vanilla_opd', 'opsd'):
++                    if a.method in ('ren_graft', 'causal_topk', 'union_topk'):
+                         topk = [head(h[pos:pos+a.logit_chunk_size]).float().topk(k, -1).indices.cpu()
+                                 for pos in range(0, len(h), a.logit_chunk_size)]
+                         payload['causal_topk_ids'] = torch.cat(topk) if topk else torch.empty((0, k), dtype=torch.long)
+@@ -195,7 +195,9 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank,
+     if not torch.isfinite(loss_sum):
+         raise FloatingPointError('Non-finite distillation loss')
+     optimizer.step()
+-    return {'round': a.round, 'completed_updates': a.round+1, 'forward_kl': loss_sum.item()/active,
++    objective_value = loss_sum.item()/active
++    return {'round': a.round, 'completed_updates': a.round+1, 'objective_loss': objective_value,
++            'forward_kl': objective_value,  # legacy field name kept for older analysis scripts
+             'grad_norm': grad.item(), 'reasoning_tokens': positions, 'supervised_trajectories': active,
+             'trajectories': expected, 'update_seconds': time.monotonic()-started}
+ 
+@@ -433,7 +435,7 @@ def pipeline_round(a, workers, students, hindsight, teacher):
+             if r['index'] in targets[rank]:
+                 raise RuntimeError('Duplicate target from scoring service')
+             targets[rank][r['index']] = {key: r[key] for key in
+-                ('correction_ids', 'teacher_probs', 'teacher_hidden', 'student_hidden', 'teacher_scored') if key in r}
++                ('correction_ids', 'recognition_ids', 'teacher_probs', 'teacher_hidden', 'student_hidden', 'teacher_scored') if key in r}
+             if dummy is None:
+                 dummy = {key: r[key] for key in ('causal_prompt_ids', 'response_ids')}
+                 dummy.update(positions=[], snapshot_round=a.round, dummy=True)
+@@ -597,7 +599,7 @@ def run_persistent(a):
+             workers.expect(conn, 'ready')
+         if teacher:
+             ready = workers.expect(teacher, 'ready')
+-            if a.method == 'vanilla_opd':
++            if a.method in ('vanilla_opd', 'ren_opd'):
+                 for conn in students:
+                     conn.send({'op': 'teacher_head', 'state': ready['teacher_head']})
+                 for conn in students:
+diff --git a/lulu/teacher_service.py b/lulu/teacher_service.py
+index d5beec7..783ad41 100644
+--- a/lulu/teacher_service.py
++++ b/lulu/teacher_service.py
+@@ -20,7 +20,7 @@ from lulu import training
+ 
+ _RECORD_KEYS = frozenset(('causal_prompt_ids', 'response_ids', 'positions', 'correction_ids'))
+ _REQUEST_KEYS = frozenset(('op', 'round', 'request_id', 'records'))
+-_TEACHER_METHODS = frozenset(('ren_opd', 'causal_topk', 'union_topk', 'vanilla_opd'))
++_TEACHER_METHODS = frozenset(('ren_opd', 'ren_graft', 'causal_topk', 'union_topk', 'vanilla_opd'))
+ 
+ 
+ def _integers(value, name, *, nonempty=False):
+@@ -51,9 +51,14 @@ def sanitize_score_request(request, method, *, vocab_size=None, max_sequence_tok
+         raise ValueError('Teacher records must be a sequence')
+     result = []
+     for record in request['records']:
+-        required = _RECORD_KEYS - {'correction_ids'} if method == 'vanilla_opd' else _RECORD_KEYS
+-        if not isinstance(record, dict) or not required <= set(record) <= _RECORD_KEYS:
+-            raise ValueError('Teacher record contains missing or forbidden fields; only causal tokens and candidate IDs are allowed')
++        if method in ('vanilla_opd', 'ren_opd'):
++            required = {'causal_prompt_ids', 'response_ids', 'positions'}
++            allowed = required
++        else:
++            required = {'causal_prompt_ids', 'response_ids', 'positions', 'correction_ids'}
++            allowed = required
++        if not isinstance(record, dict) or not required <= set(record) <= allowed:
++            raise ValueError('Teacher record contains missing or forbidden fields; only causal tokens and required candidate IDs are allowed')
+         prompt = _integers(record['causal_prompt_ids'], 'causal_prompt_ids', nonempty=True)
+         response = _integers(record['response_ids'], 'response_ids')
+         positions = _integers(record['positions'], 'positions')
+@@ -67,11 +72,11 @@ def sanitize_score_request(request, method, *, vocab_size=None, max_sequence_tok
+         if 'correction_ids' in record:
+             ids = torch.as_tensor(record['correction_ids'])
+             if ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+-                raise ValueError('Teacher correction_ids must be integer tensors')
++                raise ValueError('Teacher correction_ids must be an integer tensor')
+             if ids.ndim != 2 or ids.shape[0] != len(positions):
+                 raise ValueError('Teacher correction_ids must have shape [reasoning_positions, candidates]')
+             if bool((ids < -1).any()) or (vocab_size is not None and bool((ids >= vocab_size).any())):
+-                raise ValueError('Teacher correction_ids must be -1 padding or valid vocabulary IDs')
++                raise ValueError('Teacher correction_ids contains invalid vocabulary IDs')
+             clean['correction_ids'] = ids.detach().to(device='cpu', dtype=torch.long).contiguous()
+         result.append(clean)
+     return {'op': 'score', 'round': round_index, 'request_id': request_id, 'records': result}
+@@ -105,7 +110,10 @@ def score_records(model, tokenizer, records, args):
+         states = training.selected_hidden(model, tokenizer, batch, 'causal_prompt_ids', args)
+         for record, hidden in zip(batch, states):
+             hidden = _full_tensor(hidden)
+-            if args.method == 'vanilla_opd':
++            if args.method in ('vanilla_opd', 'ren_opd'):
++                # ReN keeps the Teacher strictly answer-blind: recognition IDs
++                # never cross this service boundary.  The Student update combines
++                # these causal Teacher states with locally cached hindsight Top-K.
+                 result.append({'teacher_hidden': hidden.detach().cpu().contiguous(), 'teacher_scored': True})
+                 continue
+             chunks = []
+@@ -216,7 +224,7 @@ def teacher_worker(args, rank, world, device_ids, address, port, conn):
+                  'backend': 'transformers_tp' if world > 1 else 'transformers',
+                  'tp_reductions': 'synchronous_rowwise' if world > 1 else None,
+                  'seconds': time.monotonic() - started}
+-        if args.method == 'vanilla_opd':
++        if args.method in ('vanilla_opd', 'ren_opd'):
+             # All TP ranks participate should a future head itself be sharded.
+             head = model.get_output_embeddings()
+             weight = _full_tensor(head.weight.detach()).cpu().contiguous()
+diff --git a/lulu/training.py b/lulu/training.py
+index 7b0a71d..fe75879 100644
+--- a/lulu/training.py
++++ b/lulu/training.py
+@@ -28,10 +28,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
+ from torch.utils.checkpoint import checkpoint
+ 
+ from lulu.data import build_prompt_views, load_prepared_jsonl, reasoning_token_mask
+-from lulu.objective import build_cached_target, forward_kl
++from lulu.objective import (build_cached_target, forward_kl, probability_mass_at_ids,
++                            recognition_weighted_forward_kl)
+ from lulu.paths import PROJECT_ROOT
+ 
+-METHODS = ('ren_opd', 'vanilla_opd', 'opsd', 'causal_topk', 'union_topk')
++METHODS = ('ren_opd', 'ren_graft', 'vanilla_opd', 'opsd', 'causal_topk', 'union_topk')
+ 
+ 
+ def parser():
+@@ -356,12 +357,19 @@ def collect_phase(a):
+             scored = records[score_start:score_start+a.score_batch_size]
+             with torch.inference_mode():
+                 causal = selected_hidden(model, tok, scored, 'causal_prompt_ids', a)
+-                need_h = a.method in ('ren_opd', 'opsd', 'union_topk')
++                need_h = a.method in ('ren_opd', 'ren_graft', 'opsd', 'union_topk')
+                 hindsight = selected_hidden(model, tok, scored, 'hindsight_prompt_ids', a) if need_h else [None]*len(scored)
+                 head = base_model(model).get_output_embeddings()
+                 for record, c, h in zip(scored, causal, hindsight):
+                     record['student_hidden'] = (h if a.method == 'opsd' else c).cpu()
+-                    if a.method not in ('vanilla_opd', 'opsd'):
++                    if a.method == 'ren_opd':
++                        recognition = []
++                        k = min(a.top_k, head.weight.shape[0])
++                        for pos in range(0, h.shape[0], a.logit_chunk_size):
++                            hs = head(h[pos:pos+a.logit_chunk_size]).float().topk(k, dim=-1).indices
++                            recognition.append(hs.cpu())
++                        record['recognition_ids'] = torch.cat(recognition) if recognition else torch.empty((0, k), dtype=torch.long)
++                    elif a.method not in ('vanilla_opd', 'opsd'):
+                         all_ids, all_causal_probs = [], []
+                         k = min(a.top_k, head.weight.shape[0])
+                         for pos in range(0, c.shape[0], a.logit_chunk_size):
+@@ -408,7 +416,7 @@ def teacher_phase(a):
+     state = load_tensor_file(cache / 'student_head.pt')
+     check_vocab(student_tok, teacher_tok, state['weight'].shape[0], teacher.get_output_embeddings().weight.shape[0])
+     del state
+-    if a.method == 'vanilla_opd' and a.worker_rank == 0:
++    if a.method in ('vanilla_opd', 'ren_opd') and a.worker_rank == 0:
+         atomic_torch(cache / 'teacher_head.pt', head_state(teacher))
+     files = sorted(cache.glob('rollout_*.pt'))[a.worker_rank::a.worker_world]
+     head = teacher.get_output_embeddings()
+@@ -418,7 +426,9 @@ def teacher_phase(a):
+         with torch.inference_mode():
+             hidden = selected_hidden(teacher, student_tok, records, 'causal_prompt_ids', a)
+             for record, h, path in zip(records, hidden, batch_files):
+-                if a.method == 'vanilla_opd':
++                if a.method in ('vanilla_opd', 'ren_opd'):
++                    # ReN combines answer-blind Teacher hidden states with the
++                    # locally cached hindsight Top-K only during Student update.
+                     record['teacher_hidden'] = h.cpu()
+                 else:
+                     probabilities = []
+@@ -428,14 +438,14 @@ def teacher_phase(a):
+                         logp = logits.gather(-1, ids.clamp_min(0)) - logits.logsumexp(-1, keepdim=True)
+                         probabilities.append(logp.exp().masked_fill(ids < 0, 0).cpu())
+                     record['teacher_probs'] = torch.cat(probabilities) if probabilities else torch.empty_like(record['correction_ids'], dtype=torch.float32)
+-                if a.method not in ('vanilla_opd', 'opsd'):
+-                    positive = (record['teacher_probs'] > record['causal_candidate_probs']) & (record['correction_ids'] >= 0)
+-                    record['diagnostics'] = {
+-                        'frontier_actions': int((record['correction_ids'] >= 0).sum()),
+-                        'positive_corrections': int(positive.sum()),
+-                        'corrected_positions': int(positive.any(-1).sum()),
+-                        'added_mass_sum': float((record['teacher_probs'] - record['causal_candidate_probs']).clamp_min(0).sum()),
+-                    }
++                    if a.method != 'opsd':
++                        positive = (record['teacher_probs'] > record['causal_candidate_probs']) & (record['correction_ids'] >= 0)
++                        record['diagnostics'] = {
++                            'frontier_actions': int((record['correction_ids'] >= 0).sum()),
++                            'positive_corrections': int(positive.sum()),
++                            'corrected_positions': int(positive.any(-1).sum()),
++                            'added_mass_sum': float((record['teacher_probs'] - record['causal_candidate_probs']).clamp_min(0).sum()),
++                        }
+                 record['teacher_scored'] = True
+                 atomic_torch(path, record)
+         print(json.dumps({'phase': 'teacher', 'worker': a.worker_rank, 'done': min(start+a.score_batch_size, len(files)),
+@@ -469,21 +479,29 @@ class DistillationStep(nn.Module):
+                 probs = probs[start:end].to(hs.device) if probs is not None else None
+                 th = r.get('teacher_hidden')
+                 th = th[start:end].to(hs.device) if th is not None else None
+-
+-                def chunk_loss(live, frozen, ids, probs, th):
++                recognition_ids = r.get('recognition_ids')
++                recognition_ids = recognition_ids[start:end].to(hs.device) if recognition_ids is not None else None
++
++                def chunk_loss(live, frozen, ids, probs, th, recognition_ids):
++                    causal_logits = self.frozen_head(frozen)
++                    live_logits = head(live)
++                    if a.method == 'ren_opd':
++                        teacher_logits = self.teacher_head(th)
++                        with torch.no_grad():
++                            recognition_mass = probability_mass_at_ids(teacher_logits, recognition_ids)
++                        return recognition_weighted_forward_kl(
++                            live_logits, causal_logits, teacher_logits, recognition_mass, reduction='none').sum()
+                     with torch.no_grad():
+                         if a.method == 'vanilla_opd':
+                             target = self.teacher_head(th).float().softmax(-1)
++                        elif a.method == 'opsd':
++                            target = causal_logits.float().softmax(-1)
+                         else:
+-                            logits = self.frozen_head(frozen)
+-                            if a.method == 'opsd':
+-                                target = logits.float().softmax(-1)
+-                            else:
+-                                target = build_cached_target(logits, ids, probs, method=a.method)
+-                    return forward_kl(head(live), target, reduction='none').sum()
++                            target = build_cached_target(causal_logits, ids, probs, method=a.method)
++                    return forward_kl(live_logits, target, reduction='none').sum()
+ 
+-                value = checkpoint(chunk_loss, hs[start:end], frozen, ids, probs, th,
+-                                   use_reentrant=False) if a.gradient_checkpointing else chunk_loss(hs[start:end], frozen, ids, probs, th)
++                value = checkpoint(chunk_loss, hs[start:end], frozen, ids, probs, th, recognition_ids,
++                                   use_reentrant=False) if a.gradient_checkpointing else chunk_loss(hs[start:end], frozen, ids, probs, th, recognition_ids)
+                 total = total + value / n
+         return total
+ 
+@@ -501,7 +519,7 @@ def update_phase(a):
+         raise RuntimeError(f'Incomplete round: {len(files)} rollouts, expected {expected}')
+     student, tok = load_student(a, current, trainable=True), load_tokenizer(a.model)
+     frozen_head = load_head(cache / 'student_head.pt', device)
+-    teacher_head = load_head(cache / 'teacher_head.pt', device) if a.method == 'vanilla_opd' else None
++    teacher_head = load_head(cache / 'teacher_head.pt', device) if a.method in ('vanilla_opd', 'ren_opd') else None
+     step_model = DistillationStep(student, frozen_head, teacher_head, tok, a)
+     optimizer = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad],
+                                  lr=a.learning_rate, weight_decay=a.weight_decay)
+@@ -564,7 +582,9 @@ def update_phase(a):
+         if not torch.isfinite(loss_sum):
+             raise FloatingPointError('Non-finite distillation loss')
+         optimizer.step()
+-        entry = {'round': a.round, 'update': update, 'forward_kl': loss_sum.item()/total_active,
++        objective_value = loss_sum.item()/total_active
++        entry = {'round': a.round, 'update': update, 'objective_loss': objective_value,
++                 'forward_kl': objective_value,  # legacy field name kept for older analysis scripts
+                  'grad_norm': grad_norm.item(), 'reasoning_tokens': total_positions,
+                  'trajectories': expected, 'supervised_trajectories': total_active, 'seconds': time.monotonic()-started,
+                  **dict(zip(diagnostic_keys, diagnostic_totals.tolist()))}
+diff --git a/tests/test_lulu_hindsight_service.py b/tests/test_lulu_hindsight_service.py
+index e85602b..2195dbd 100644
+--- a/tests/test_lulu_hindsight_service.py
++++ b/tests/test_lulu_hindsight_service.py
+@@ -53,7 +53,7 @@ def _records(model):
+     return records, tok
+ 
+ 
+-@pytest.mark.parametrize('method', ['ren_opd', 'union_topk', 'opsd', 'causal_topk', 'vanilla_opd'])
++@pytest.mark.parametrize('method', ['ren_opd', 'ren_graft', 'union_topk', 'opsd', 'causal_topk', 'vanilla_opd'])
+ @pytest.mark.parametrize('chunk', [1, 20])
+ def test_hindsight_results_equal_dense_forward_without_exposing_prompts(method, chunk):
+     model = _student().eval().requires_grad_(False)
+@@ -71,10 +71,14 @@ def test_hindsight_results_equal_dense_forward_without_exposing_prompts(method,
+             else:
+                 cs = record['causal_topk_ids']
+                 hs = training.base_model(model).get_output_embeddings()(hidden).topk(4).indices
+-                novel = hs.masked_fill(hs.unsqueeze(-1).eq(cs.unsqueeze(-2)).any(-1), -1)
+-                expected = cs if method == 'causal_topk' else torch.cat((cs, novel), -1) if method == 'union_topk' else novel
+-                torch.testing.assert_close(actual['correction_ids'], expected)
+-                assert actual['correction_ids'].device.type == 'cpu'
++                if method == 'ren_opd':
++                    torch.testing.assert_close(actual['recognition_ids'], hs)
++                    assert actual['recognition_ids'].device.type == 'cpu'
++                else:
++                    novel = hs.masked_fill(hs.unsqueeze(-1).eq(cs.unsqueeze(-2)).any(-1), -1)
++                    expected = cs if method == 'causal_topk' else torch.cat((cs, novel), -1) if method == 'union_topk' else novel
++                    torch.testing.assert_close(actual['correction_ids'], expected)
++                    assert actual['correction_ids'].device.type == 'cpu'
+ 
+ 
+ @pytest.mark.parametrize('lora', [False, True])
+diff --git a/tests/test_lulu_objective.py b/tests/test_lulu_objective.py
+index 256d7d6..606d2f3 100644
+--- a/tests/test_lulu_objective.py
++++ b/tests/test_lulu_objective.py
+@@ -3,20 +3,54 @@ from __future__ import annotations
+ import pytest
+ import torch
+ 
+-from lulu.objective import build_cached_target, build_target, forward_kl, reduce_position_losses
++from lulu.objective import (build_cached_target, build_target, forward_kl,
++                            probability_mass_at_ids, recognition_weighted_forward_kl,
++                            reduce_position_losses)
+ 
+ 
+ def _probabilities():
+-    # C top-2 = {0,1}; H top-2 = {2,3}; only token 2 has qT > pC.
++    # C top-2 = {0,1}; H top-2 = {2,3}; qT(H-top2)=0.55.
+     c = torch.tensor([[.40, .30, .15, .10, .05]], dtype=torch.float64)
+     h = torch.tensor([[.10, .10, .40, .30, .10]], dtype=torch.float64)
+     t = torch.tensor([[.20, .10, .50, .05, .15]], dtype=torch.float64)
+     return c, h, t
+ 
+ 
+-def test_ren_exact_positive_teacher_graft_and_full_vocab_normalization():
++def test_ren_target_uses_hindsight_only_as_teacher_trust_weight():
+     c, h, t = _probabilities()
+-    actual, stats = build_target(c.log(), h.log(), t.log(), 2, return_diagnostics=True)
++    target, stats = build_target(c.log(), h.log(), t.log(), 2, return_diagnostics=True)
++    alpha = t[0, [2, 3]].sum()
++    expected = alpha * t + (1 - alpha) * c
++    torch.testing.assert_close(target, expected)
++    assert stats['recognition_mass'].item() == pytest.approx(alpha.item())
++    # Changing hindsight probabilities without changing its Top-K must not change the target.
++    h_same_frontier = torch.tensor([[.01, .01, .55, .42, .01]], dtype=h.dtype)
++    torch.testing.assert_close(build_target(c.log(), h_same_frontier.log(), t.log(), 2), target)
++
++
++def test_recognition_weighted_objective_preserves_student_and_learns_teacher():
++    c, h, t = _probabilities()
++    live = c.log().clone().requires_grad_()
++    ids = h.topk(2, -1).indices
++    alpha = probability_mass_at_ids(t.log(), ids)
++    loss, parts = recognition_weighted_forward_kl(
++        live, c.log(), t.log(), alpha, return_components=True)
++    expected = alpha.squeeze() * forward_kl(live, t) + (1 - alpha.squeeze()) * forward_kl(live, c)
++    torch.testing.assert_close(loss, expected)
++    assert parts['preserve_kl'].item() == pytest.approx(0.0, abs=1e-14)
++    loss.backward()
++    assert live.grad.abs().sum().item() > 0
++    # At alpha=0, the frozen causal policy is an exact fixed point.
++    anchored = c.log().clone().requires_grad_()
++    zero = recognition_weighted_forward_kl(anchored, c.log(), t.log(), torch.zeros(1, dtype=c.dtype))
++    zero.backward()
++    assert zero.item() == pytest.approx(0.0, abs=1e-14)
++    torch.testing.assert_close(anchored.grad, torch.zeros_like(anchored.grad), atol=1e-14, rtol=0)
++
++
++def test_legacy_ren_graft_exact_positive_teacher_graft_and_full_vocab_normalization():
++    c, h, t = _probabilities()
++    actual, stats = build_target(c.log(), h.log(), t.log(), 2, method="ren_graft", return_diagnostics=True)
+     unnormalized = c.clone()
+     unnormalized[0, 2] = t[0, 2]
+     expected = unnormalized / unnormalized.sum(-1, keepdim=True)
+@@ -32,8 +66,8 @@ def test_ren_exact_positive_teacher_graft_and_full_vocab_normalization():
+ def test_hindsight_defines_only_frontier_not_target_values():
+     c, h, t = _probabilities()
+     changed_h = torch.tensor([[.01, .01, .55, .42, .01]], dtype=h.dtype)
+-    first = build_target(c.log(), h.log(), t.log(), 2)
+-    second = build_target(c.log(), changed_h.log(), t.log(), 2)
++    first = build_target(c.log(), h.log(), t.log(), 2, method="ren_graft")
++    second = build_target(c.log(), changed_h.log(), t.log(), 2, method="ren_graft")
+     torch.testing.assert_close(first, second)
+ 
+ 
+@@ -48,7 +82,7 @@ def test_no_correction_keeps_snapshot_and_zero_initial_gradient(empty_reason):
+     else:
+         k = 100
+     train_logits = c.log().requires_grad_()
+-    target = build_target(c.log(), h.log(), t.log(), k)
++    target = build_target(c.log(), h.log(), t.log(), k, method="ren_graft")
+     loss = forward_kl(train_logits, target)
+     loss.backward()
+     torch.testing.assert_close(target, c)
+@@ -58,7 +92,7 @@ def test_no_correction_keeps_snapshot_and_zero_initial_gradient(empty_reason):
+ 
+ def test_no_correction_positions_regularize_student_drift_within_round():
+     c, _, t = _probabilities()
+-    target = build_target(c.log(), c.log(), t.log(), 2)
++    target = build_target(c.log(), c.log(), t.log(), 2, method="ren_graft")
+     changed_logits = (c.log() + torch.tensor([[0., 0., 1., 0., 0.]])).requires_grad_()
+     loss = forward_kl(changed_logits, target)
+     loss.backward()
+@@ -174,10 +208,10 @@ def test_invalid_topk_fails_clearly(k):
+         build_target(c.log(), h.log(), t.log(), k)
+ 
+ 
+-@pytest.mark.parametrize("method", ["ren_opd", "causal_topk", "union_topk"])
++@pytest.mark.parametrize("method", ["ren_graft", "causal_topk", "union_topk"])
+ def test_sparse_cached_target_matches_dense_teacher_and_detaches_sources(method):
+     c, h, t = _probabilities()
+-    support = {"ren_opd": [2, 3], "causal_topk": [0, 1], "union_topk": [0, 1, 2, 3]}[method]
++    support = {"ren_graft": [2, 3], "causal_topk": [0, 1], "union_topk": [0, 1, 2, 3]}[method]
+     ids = torch.tensor([support + [-1, -1]])
+     teacher_probs = torch.tensor([[*t[0, support].tolist(), 999., 999.]], dtype=t.dtype, requires_grad=True)
+     actual, stats = build_cached_target(c.log().requires_grad_(), ids, teacher_probs, method=method, return_diagnostics=True)
+diff --git a/tests/test_lulu_persistent.py b/tests/test_lulu_persistent.py
+index cc02973..c9ca6de 100644
+--- a/tests/test_lulu_persistent.py
++++ b/tests/test_lulu_persistent.py
+@@ -59,13 +59,13 @@ def test_methods_only_reserve_the_roles_they_use(method, expected):
+ 
+ def test_teacher_payload_cannot_include_gold_or_hindsight_hidden_states():
+     records = [{'index': 9, 'causal_prompt_ids': [3, 4], 'response_ids': [5, 6],
+-        'positions': [0, 1], 'correction_ids': torch.tensor([[1, -1], [2, 3]]),
++        'positions': [0, 1], 'recognition_ids': torch.tensor([[1, 7], [2, 3]]),
+         'gold_answer': 'SECRET GOLD', 'hindsight_prompt_ids': [29, 30],
+         'student_hidden': torch.randn(2, 16), 'causal_topk_ids': torch.tensor([[7, 8], [9, 10]])}]
+     payload = persistent.teacher_payload(records)
+     clean = sanitize_score_request({'op': 'score', 'round': 0, 'request_id': 9, 'records': payload},
+                                    'ren_opd', vocab_size=31)
+-    assert set(clean['records'][0]) == {'causal_prompt_ids', 'response_ids', 'positions', 'correction_ids'}
++    assert set(clean['records'][0]) == {'causal_prompt_ids', 'response_ids', 'positions'}
+     assert 'gold_answer' in records[0]  # Boundary extraction also leaves the caller's record intact.
+ 
+ 
+@@ -109,10 +109,18 @@ class _PipelineHarness:
+         elif op == 'score':
+             if conn.role == 'teacher':
+                 sanitize_score_request(message, self.method, vocab_size=31)
+-                result = [{'teacher_probs': torch.full_like(record['correction_ids'], .02, dtype=torch.float32)}
+-                          for record in message['records']]
++                if self.method == 'ren_opd':
++                    result = [{'teacher_hidden': torch.ones(len(record['positions']), 16),
++                               'teacher_scored': True}
++                              for record in message['records']]
++                else:
++                    result = [{'teacher_probs': torch.full_like(record['correction_ids'], .02, dtype=torch.float32),
++                               'teacher_scored': True}
++                              for record in message['records']]
+             elif self.method == 'opsd':
+                 result = [{'student_hidden': torch.ones(len(record['positions']), 16)} for record in message['records']]
++            elif self.method == 'ren_opd':
++                result = [{'recognition_ids': torch.tensor([[7, 10], [8, 9]])} for _ in message['records']]
+             else:
+                 result = [{'correction_ids': torch.tensor([[7, -1], [8, 9]])} for _ in message['records']]
+             self._queue(conn, {'op': 'scored', 'round': version, 'request_id': message['request_id'],
+@@ -355,10 +363,11 @@ def test_collected_cpu_frozen_cache_is_normal_tensor_and_supports_backward(monke
+     assert not hidden.requires_grad
+     assert 'hindsight_prompt_ids' not in records[0]
+     assert 'student_hidden' not in payload[0]
+-    records[0].update(correction_ids=torch.tensor([[6, -1], [7, -1]]),
+-                      teacher_probs=torch.tensor([[.2, 0.], [.15, 0.]]), teacher_scored=True)
++    teacher_head = copy.deepcopy(model.get_output_embeddings()).requires_grad_(False)
++    records[0].update(teacher_hidden=torch.randn(2, model.config.hidden_size),
++                      recognition_ids=torch.tensor([[1, 2, 3], [4, 5, 6]]), teacher_scored=True)
+     frozen_head = copy.deepcopy(model.get_output_embeddings()).requires_grad_(False)
+-    step = training.DistillationStep(model, frozen_head, None, tokenizer, args)
++    step = training.DistillationStep(model, frozen_head, teacher_head, tokenizer, args)
+     loss = step(records)
+     loss.backward()
+     assert torch.isfinite(loss)
+diff --git a/tests/test_lulu_teacher_service.py b/tests/test_lulu_teacher_service.py
+index 5253c0b..88acb2f 100644
+--- a/tests/test_lulu_teacher_service.py
++++ b/tests/test_lulu_teacher_service.py
+@@ -23,41 +23,47 @@ def _args(method='ren_opd', batch=2, chunk=2):
+                            max_sequence_tokens=128, cpu=True, dtype='float32')
+ 
+ 
+-def _request(round_index=0, request_id='0:0'):
+-    return {'op': 'score', 'round': round_index, 'request_id': request_id, 'records': [
+-        {'causal_prompt_ids': [3, 4], 'response_ids': [6, 7, 8, 9], 'positions': [0, 1, 3],
+-         'correction_ids': torch.tensor([[0, 6, -1], [30, 2, 7], [-1, -1, -1]])},
+-        {'causal_prompt_ids': [3, 5, 10], 'response_ids': [12, 13], 'positions': [],
+-         'correction_ids': torch.empty((0, 3), dtype=torch.long)},
+-        {'causal_prompt_ids': [3, 5, 11], 'response_ids': [12, 13, 14], 'positions': [0, 2],
+-         'correction_ids': torch.tensor([[4, 1, 2], [7, -1, 3]])},
+-    ]}
+-
+-
+-@pytest.mark.parametrize('method', ['ren_opd', 'causal_topk', 'union_topk'])
++def _request(round_index=0, request_id='0:0', method='ren_opd'):
++    records = [
++        {'causal_prompt_ids': [3, 4], 'response_ids': [6, 7, 8, 9], 'positions': [0, 1, 3]},
++        {'causal_prompt_ids': [3, 5, 10], 'response_ids': [12, 13], 'positions': []},
++        {'causal_prompt_ids': [3, 5, 11], 'response_ids': [12, 13, 14], 'positions': [0, 2]},
++    ]
++    if method not in ('vanilla_opd', 'ren_opd'):
++        values = [torch.tensor([[0, 6, -1], [30, 2, 7], [-1, -1, -1]]),
++                  torch.empty((0, 3), dtype=torch.long),
++                  torch.tensor([[4, 1, 2], [7, -1, 3]])]
++        for record, value in zip(records, values):
++            record['correction_ids'] = value
++    return {'op': 'score', 'round': round_index, 'request_id': request_id, 'records': records}
++
++
++@pytest.mark.parametrize('method', ['ren_opd', 'ren_graft', 'causal_topk', 'union_topk'])
+ @pytest.mark.parametrize('batch,chunk', [(1, 1), (2, 2), (8, 32)])
+ def test_selected_probabilities_equal_dense_teacher_softmax(method, batch, chunk):
+     model, tok, args = _model(), SimpleNamespace(pad_token_id=0), _args(method, batch, chunk)
+-    records = teacher_service.sanitize_score_request(_request(), method, vocab_size=31)['records']
++    records = teacher_service.sanitize_score_request(_request(method=method), method, vocab_size=31)['records']
+     actual = teacher_service.score_records(model, tok, records, args)
+     with torch.inference_mode():
+         hidden = training.selected_hidden(model, tok, records, 'causal_prompt_ids', args)
+         for record, states, result in zip(records, hidden, actual):
+             probabilities = model.get_output_embeddings()(states).float().softmax(-1)
+-            ids = record['correction_ids']
+-            expected = probabilities.gather(-1, ids.clamp_min(0)).masked_fill(ids < 0, 0)
+-            torch.testing.assert_close(result['teacher_probs'], expected, atol=1e-7, rtol=1e-6)
+-            assert result['teacher_probs'].device.type == 'cpu'
+-            assert result['teacher_probs'].dtype == torch.float32
+-            assert not result['teacher_probs'].requires_grad
++            if method == 'ren_opd':
++                torch.testing.assert_close(result['teacher_hidden'], states)
++                assert 'teacher_probs' not in result
++            else:
++                ids = record['correction_ids']
++                expected = probabilities.gather(-1, ids.clamp_min(0)).masked_fill(ids < 0, 0)
++                torch.testing.assert_close(result['teacher_probs'], expected, atol=1e-7, rtol=1e-6)
++                assert result['teacher_probs'].device.type == 'cpu'
++                assert result['teacher_probs'].dtype == torch.float32
++                assert not result['teacher_probs'].requires_grad
+             assert result['teacher_scored'] is True
+ 
+ 
+ def test_vanilla_hidden_reconstructs_teacher_distribution():
+     model, tok, args = _model(), SimpleNamespace(pad_token_id=0), _args('vanilla_opd')
+-    request = _request()
+-    for record in request['records']:
+-        del record['correction_ids']
++    request = _request(method='vanilla_opd')
+     records = teacher_service.sanitize_score_request(request, args.method)['records']
+     actual = teacher_service.score_records(model, tok, records, args)
+     with torch.inference_mode():
+@@ -87,10 +93,10 @@ def test_teacher_rejects_extra_fields_instead_of_silently_receiving_gold(field):
+     lambda r: r['records'][0].update(causal_prompt_ids=[31]),
+ ])
+ def test_teacher_validates_shapes_positions_and_ids(change):
+-    request = _request()
++    request = _request(method='ren_graft')
+     change(request)
+     with pytest.raises(ValueError):
+-        teacher_service.sanitize_score_request(request, 'ren_opd', vocab_size=31)
++        teacher_service.sanitize_score_request(request, 'ren_graft', vocab_size=31)
+ 
+ 
+ def test_teacher_refuses_silent_context_truncation():
+diff --git a/tests/test_lulu_training.py b/tests/test_lulu_training.py
+index 0a27831..03480af 100644
+--- a/tests/test_lulu_training.py
++++ b/tests/test_lulu_training.py
+@@ -15,7 +15,8 @@ import torch.distributed as dist
+ import torch.multiprocessing as mp
+ 
+ from lulu import training
+-from lulu.objective import build_target, forward_kl
++from lulu.objective import (build_target, forward_kl, probability_mass_at_ids,
++                            recognition_weighted_forward_kl)
+ 
+ 
+ def _student(lora=False):
+@@ -68,7 +69,10 @@ def _records(snapshot, method, *, include_empty=False):
+             record['diagnostics'] = {'frontier_actions': len(causal) * 3,
+                 'positive_corrections': len(causal), 'corrected_positions': len(causal),
+                 'added_mass_sum': len(causal) * .1}
+-            if method in ('ren_opd', 'causal_topk', 'union_topk'):
++            if method == 'ren_opd':
++                hs = frozen_head(hindsight).topk(3, dim=-1).indices
++                record['recognition_ids'] = hs
++            elif method in ('ren_graft', 'causal_topk', 'union_topk'):
+                 cs = frozen_head(causal).topk(3, dim=-1).indices
+                 hs = frozen_head(hindsight).topk(3, dim=-1).indices
+                 novel = ~hs.unsqueeze(-1).eq(cs.unsqueeze(-2)).any(-1)
+@@ -88,9 +92,16 @@ def _dense_loss(student, records, frozen_head, teacher_head, tok, method):
+         if not r['positions'] or r.get('dummy'):
+             total = total + live.sum() * 0. + head.weight.reshape(-1)[0] * 0.
+             continue
+-        target = build_target(frozen_head(r['causal_hidden']), frozen_head(r['hindsight_hidden']),
+-                              teacher_head(r['teacher_hidden']), 3, method)
+-        total = total + forward_kl(head(live), target)
++        causal_logits = frozen_head(r['causal_hidden'])
++        teacher_logits = teacher_head(r['teacher_hidden'])
++        if method == 'ren_opd':
++            alpha = probability_mass_at_ids(teacher_logits, r['recognition_ids'])
++            total = total + recognition_weighted_forward_kl(
++                head(live), causal_logits, teacher_logits, alpha)
++        else:
++            target = build_target(causal_logits, frozen_head(r['hindsight_hidden']),
++                                  teacher_logits, 3, method)
++            total = total + forward_kl(head(live), target)
+     return total
+ 
+ 
+@@ -217,7 +228,6 @@ def test_two_rank_update_matches_global_nonempty_sequence_mean_with_dummy_rank(t
+     assert metrics['trajectories'] == 3
+     assert metrics['supervised_trajectories'] == 2
+     assert metrics['reasoning_tokens'] == 6
+-    assert metrics['frontier_actions'] == 18
+     assert metrics['forward_kl'] == pytest.approx(reference.item(), abs=2e-7, rel=2e-5)
+ 
+ 

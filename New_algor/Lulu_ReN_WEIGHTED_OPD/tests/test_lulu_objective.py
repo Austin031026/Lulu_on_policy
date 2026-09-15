@@ -9,16 +9,48 @@ from lulu.objective import (build_cached_target, build_target, forward_kl,
 
 
 def _probabilities():
-    # C top-2 = {0,1}; H top-2 = {2,3}; only token 2 has qT > pC.
+    # C top-2 = {0,1}; H top-2 = {2,3}; qT(H-top2)=0.55.
     c = torch.tensor([[.40, .30, .15, .10, .05]], dtype=torch.float64)
     h = torch.tensor([[.10, .10, .40, .30, .10]], dtype=torch.float64)
     t = torch.tensor([[.20, .10, .50, .05, .15]], dtype=torch.float64)
     return c, h, t
 
 
-def test_ren_exact_positive_teacher_graft_and_full_vocab_normalization():
+def test_ren_target_uses_hindsight_only_as_teacher_trust_weight():
     c, h, t = _probabilities()
-    actual, stats = build_target(c.log(), h.log(), t.log(), 2, return_diagnostics=True)
+    target, stats = build_target(c.log(), h.log(), t.log(), 2, return_diagnostics=True)
+    alpha = t[0, [2, 3]].sum()
+    expected = alpha * t + (1 - alpha) * c
+    torch.testing.assert_close(target, expected)
+    assert stats['recognition_mass'].item() == pytest.approx(alpha.item())
+    # Changing hindsight probabilities without changing its Top-K must not change the target.
+    h_same_frontier = torch.tensor([[.01, .01, .55, .42, .01]], dtype=h.dtype)
+    torch.testing.assert_close(build_target(c.log(), h_same_frontier.log(), t.log(), 2), target)
+
+
+def test_recognition_weighted_objective_preserves_student_and_learns_teacher():
+    c, h, t = _probabilities()
+    live = c.log().clone().requires_grad_()
+    ids = h.topk(2, -1).indices
+    alpha = probability_mass_at_ids(t.log(), ids)
+    loss, parts = recognition_weighted_forward_kl(
+        live, c.log(), t.log(), alpha, return_components=True)
+    expected = alpha.squeeze() * forward_kl(live, t) + (1 - alpha.squeeze()) * forward_kl(live, c)
+    torch.testing.assert_close(loss, expected)
+    assert parts['preserve_kl'].item() == pytest.approx(0.0, abs=1e-14)
+    loss.backward()
+    assert live.grad.abs().sum().item() > 0
+    # At alpha=0, the frozen causal policy is an exact fixed point.
+    anchored = c.log().clone().requires_grad_()
+    zero = recognition_weighted_forward_kl(anchored, c.log(), t.log(), torch.zeros(1, dtype=c.dtype))
+    zero.backward()
+    assert zero.item() == pytest.approx(0.0, abs=1e-14)
+    torch.testing.assert_close(anchored.grad, torch.zeros_like(anchored.grad), atol=1e-14, rtol=0)
+
+
+def test_legacy_ren_graft_exact_positive_teacher_graft_and_full_vocab_normalization():
+    c, h, t = _probabilities()
+    actual, stats = build_target(c.log(), h.log(), t.log(), 2, method="ren_graft", return_diagnostics=True)
     unnormalized = c.clone()
     unnormalized[0, 2] = t[0, 2]
     expected = unnormalized / unnormalized.sum(-1, keepdim=True)
@@ -34,58 +66,9 @@ def test_ren_exact_positive_teacher_graft_and_full_vocab_normalization():
 def test_hindsight_defines_only_frontier_not_target_values():
     c, h, t = _probabilities()
     changed_h = torch.tensor([[.01, .01, .55, .42, .01]], dtype=h.dtype)
-    first = build_target(c.log(), h.log(), t.log(), 2)
-    second = build_target(c.log(), changed_h.log(), t.log(), 2)
+    first = build_target(c.log(), h.log(), t.log(), 2, method="ren_graft")
+    second = build_target(c.log(), changed_h.log(), t.log(), 2, method="ren_graft")
     torch.testing.assert_close(first, second)
-
-
-def test_weighted_target_uses_teacher_mass_on_hindsight_topk():
-    c, h, t = _probabilities()
-    actual, stats = build_target(
-        c.log(), h.log(), t.log(), 2, method="ren_weighted_opd", return_diagnostics=True)
-    alpha = t[0, [2, 3]].sum()
-    expected = alpha * t + (1.0 - alpha) * c
-    torch.testing.assert_close(actual, expected)
-    assert stats["recognition_mass"].item() == pytest.approx(alpha.item())
-
-
-def test_weighted_objective_and_optional_clip_are_exact():
-    c, h, t = _probabilities()
-    ids = h.topk(2, -1).indices
-    alpha = probability_mass_at_ids(t.log(), ids)
-    student = c.log().clone().requires_grad_()
-    actual, parts = recognition_weighted_forward_kl(
-        student, c.log(), t.log(), alpha, return_components=True)
-    expected = alpha.squeeze() * forward_kl(student, t) + (1.0 - alpha.squeeze()) * forward_kl(student, c)
-    torch.testing.assert_close(actual, expected)
-    assert parts["recognition_mass"].item() == pytest.approx(alpha.item())
-    actual.backward()
-    assert student.grad.abs().sum().item() > 0
-
-    clipped_student = c.log().clone().requires_grad_()
-    logp = clipped_student.log_softmax(-1)
-    teacher_terms = torch.xlogy(t, t) - t * logp
-    causal_terms = torch.xlogy(c, c) - c * logp
-    weighted_terms = alpha.unsqueeze(-1) * teacher_terms + (1.0 - alpha).unsqueeze(-1) * causal_terms
-    clipped = recognition_weighted_forward_kl(
-        clipped_student, c.log(), t.log(), alpha, pointwise_clip=0.05)
-    torch.testing.assert_close(clipped, weighted_terms.clamp(max=0.05).sum(-1).mean())
-
-
-def test_weighted_alpha_endpoints_preserve_or_match_teacher():
-    c, _, t = _probabilities()
-    preserve_student = c.log().clone().requires_grad_()
-    preserve = recognition_weighted_forward_kl(
-        preserve_student, c.log(), t.log(), torch.zeros(1, dtype=c.dtype))
-    preserve.backward()
-    torch.testing.assert_close(preserve, torch.zeros_like(preserve), atol=1e-15, rtol=0)
-    torch.testing.assert_close(preserve_student.grad, torch.zeros_like(preserve_student.grad), atol=1e-15, rtol=0)
-
-    teacher_student = c.log().clone().requires_grad_()
-    weighted = recognition_weighted_forward_kl(
-        teacher_student, c.log(), t.log(), torch.ones(1, dtype=c.dtype))
-    vanilla = forward_kl(teacher_student, t)
-    torch.testing.assert_close(weighted, vanilla)
 
 
 @pytest.mark.parametrize("empty_reason", ["same_frontier", "no_positive_correction", "whole_vocabulary"])
@@ -99,7 +82,7 @@ def test_no_correction_keeps_snapshot_and_zero_initial_gradient(empty_reason):
     else:
         k = 100
     train_logits = c.log().requires_grad_()
-    target = build_target(c.log(), h.log(), t.log(), k)
+    target = build_target(c.log(), h.log(), t.log(), k, method="ren_graft")
     loss = forward_kl(train_logits, target)
     loss.backward()
     torch.testing.assert_close(target, c)
@@ -109,7 +92,7 @@ def test_no_correction_keeps_snapshot_and_zero_initial_gradient(empty_reason):
 
 def test_no_correction_positions_regularize_student_drift_within_round():
     c, _, t = _probabilities()
-    target = build_target(c.log(), c.log(), t.log(), 2)
+    target = build_target(c.log(), c.log(), t.log(), 2, method="ren_graft")
     changed_logits = (c.log() + torch.tensor([[0., 0., 1., 0., 0.]])).requires_grad_()
     loss = forward_kl(changed_logits, target)
     loss.backward()
@@ -218,23 +201,6 @@ def test_large_logits_are_stable_and_half_inputs_use_float32_math():
     assert torch.isfinite(loss) and torch.isfinite(c.grad).all()
 
 
-def test_pointwise_kl_clip_caps_vocab_contributions_before_sum():
-    target = torch.tensor([[0.8, 0.2]], dtype=torch.float64)
-    student = torch.tensor([[0.01, 0.99]], dtype=torch.float64).log().requires_grad_()
-    unclipped_terms = target * (target.log() - student.log_softmax(-1))
-    expected = unclipped_terms.clamp(max=0.05).sum(-1).mean()
-    actual = forward_kl(student, target, pointwise_clip=0.05)
-    torch.testing.assert_close(actual, expected)
-    assert actual < unclipped_terms.sum()
-
-
-@pytest.mark.parametrize("value", [0, -0.1, True])
-def test_invalid_pointwise_kl_clip_is_rejected(value):
-    target = torch.tensor([[0.5, 0.5]])
-    with pytest.raises(ValueError, match="pointwise_clip"):
-        forward_kl(target.log(), target, pointwise_clip=value)
-
-
 @pytest.mark.parametrize("k", [0, -1, True, 1.5])
 def test_invalid_topk_fails_clearly(k):
     c, h, t = _probabilities()
@@ -242,10 +208,10 @@ def test_invalid_topk_fails_clearly(k):
         build_target(c.log(), h.log(), t.log(), k)
 
 
-@pytest.mark.parametrize("method", ["ren_opd", "causal_topk", "union_topk"])
+@pytest.mark.parametrize("method", ["ren_graft", "causal_topk", "union_topk"])
 def test_sparse_cached_target_matches_dense_teacher_and_detaches_sources(method):
     c, h, t = _probabilities()
-    support = {"ren_opd": [2, 3], "causal_topk": [0, 1], "union_topk": [0, 1, 2, 3]}[method]
+    support = {"ren_graft": [2, 3], "causal_topk": [0, 1], "union_topk": [0, 1, 2, 3]}[method]
     ids = torch.tensor([support + [-1, -1]])
     teacher_probs = torch.tensor([[*t[0, support].tolist(), 999., 999.]], dtype=t.dtype, requires_grad=True)
     actual, stats = build_cached_target(c.log().requires_grad_(), ids, teacher_probs, method=method, return_diagnostics=True)

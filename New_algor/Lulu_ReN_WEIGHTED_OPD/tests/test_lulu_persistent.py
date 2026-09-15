@@ -52,7 +52,6 @@ def test_invalid_or_overlapping_gpu_roles_fail_before_launch(options, message):
     ('opsd', {'student': list('0123456'), 'hindsight': ['7'], 'teacher': None}),
     ('causal_topk', {'student': list('012345'), 'hindsight': None, 'teacher': ['6', '7']}),
     ('vanilla_opd', {'student': list('012345'), 'hindsight': None, 'teacher': ['6', '7']}),
-    ('ren_weighted_opd', {'student': list('01234'), 'hindsight': ['5'], 'teacher': ['6', '7']}),
 ])
 def test_methods_only_reserve_the_roles_they_use(method, expected):
     assert persistent.allocate_roles(_args(method=method)) == expected
@@ -60,24 +59,14 @@ def test_methods_only_reserve_the_roles_they_use(method, expected):
 
 def test_teacher_payload_cannot_include_gold_or_hindsight_hidden_states():
     records = [{'index': 9, 'causal_prompt_ids': [3, 4], 'response_ids': [5, 6],
-        'positions': [0, 1], 'correction_ids': torch.tensor([[1, -1], [2, 3]]),
+        'positions': [0, 1], 'recognition_ids': torch.tensor([[1, 7], [2, 3]]),
         'gold_answer': 'SECRET GOLD', 'hindsight_prompt_ids': [29, 30],
         'student_hidden': torch.randn(2, 16), 'causal_topk_ids': torch.tensor([[7, 8], [9, 10]])}]
     payload = persistent.teacher_payload(records)
     clean = sanitize_score_request({'op': 'score', 'round': 0, 'request_id': 9, 'records': payload},
                                    'ren_opd', vocab_size=31)
-    assert set(clean['records'][0]) == {'causal_prompt_ids', 'response_ids', 'positions', 'correction_ids'}
-    assert 'gold_answer' in records[0]  # Boundary extraction also leaves the caller's record intact.
-
-
-def test_weighted_teacher_payload_does_not_expose_recognition_ids():
-    records = [{'index': 9, 'causal_prompt_ids': [3, 4], 'response_ids': [5, 6],
-        'positions': [0, 1], 'recognition_ids': torch.tensor([[1, 7], [2, 3]]),
-        'gold_answer': 'SECRET GOLD', 'hindsight_prompt_ids': [29, 30]}]
-    payload = persistent.teacher_payload(records)
-    clean = sanitize_score_request({'op': 'score', 'round': 0, 'request_id': 9, 'records': payload},
-                                   'ren_weighted_opd', vocab_size=31)
     assert set(clean['records'][0]) == {'causal_prompt_ids', 'response_ids', 'positions'}
+    assert 'gold_answer' in records[0]  # Boundary extraction also leaves the caller's record intact.
 
 
 class _FakeConnection:
@@ -120,17 +109,18 @@ class _PipelineHarness:
         elif op == 'score':
             if conn.role == 'teacher':
                 sanitize_score_request(message, self.method, vocab_size=31)
-                if self.method == 'ren_weighted_opd':
+                if self.method == 'ren_opd':
                     result = [{'teacher_hidden': torch.ones(len(record['positions']), 16),
-                               'teacher_scored': True} for record in message['records']]
+                               'teacher_scored': True}
+                              for record in message['records']]
                 else:
-                    result = [{'teacher_probs': torch.full_like(record['correction_ids'], .02, dtype=torch.float32)}
+                    result = [{'teacher_probs': torch.full_like(record['correction_ids'], .02, dtype=torch.float32),
+                               'teacher_scored': True}
                               for record in message['records']]
             elif self.method == 'opsd':
                 result = [{'student_hidden': torch.ones(len(record['positions']), 16)} for record in message['records']]
-            elif self.method == 'ren_weighted_opd':
-                result = [{'recognition_ids': torch.tensor([[7, 10], [8, 9]])}
-                          for _ in message['records']]
+            elif self.method == 'ren_opd':
+                result = [{'recognition_ids': torch.tensor([[7, 10], [8, 9]])} for _ in message['records']]
             else:
                 result = [{'correction_ids': torch.tensor([[7, -1], [8, 9]])} for _ in message['records']]
             self._queue(conn, {'op': 'scored', 'round': version, 'request_id': message['request_id'],
@@ -163,7 +153,7 @@ class _PipelineHarness:
         return message
 
 
-@pytest.mark.parametrize('method', ['ren_opd', 'ren_weighted_opd', 'opsd', 'causal_topk'])
+@pytest.mark.parametrize('method', ['ren_opd', 'opsd', 'causal_topk'])
 def test_round_synchronizes_h_before_rollout_overlaps_scoring_and_waits_for_all_targets(method):
     workers = _PipelineHarness(method=method)
     args = _args(method=method, round=3, global_batch_prompts=4)
@@ -373,10 +363,11 @@ def test_collected_cpu_frozen_cache_is_normal_tensor_and_supports_backward(monke
     assert not hidden.requires_grad
     assert 'hindsight_prompt_ids' not in records[0]
     assert 'student_hidden' not in payload[0]
-    records[0].update(correction_ids=torch.tensor([[6, -1], [7, -1]]),
-                      teacher_probs=torch.tensor([[.2, 0.], [.15, 0.]]), teacher_scored=True)
+    teacher_head = copy.deepcopy(model.get_output_embeddings()).requires_grad_(False)
+    records[0].update(teacher_hidden=torch.randn(2, model.config.hidden_size),
+                      recognition_ids=torch.tensor([[1, 2, 3], [4, 5, 6]]), teacher_scored=True)
     frozen_head = copy.deepcopy(model.get_output_embeddings()).requires_grad_(False)
-    step = training.DistillationStep(model, frozen_head, None, tokenizer, args)
+    step = training.DistillationStep(model, frozen_head, teacher_head, tokenizer, args)
     loss = step(records)
     loss.backward()
     assert torch.isfinite(loss)

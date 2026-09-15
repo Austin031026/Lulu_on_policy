@@ -20,7 +20,7 @@ from lulu import training
 
 _RECORD_KEYS = frozenset(('causal_prompt_ids', 'response_ids', 'positions', 'correction_ids'))
 _REQUEST_KEYS = frozenset(('op', 'round', 'request_id', 'records'))
-_TEACHER_METHODS = frozenset(('ren_opd', 'ren_weighted_opd', 'causal_topk', 'union_topk', 'vanilla_opd'))
+_TEACHER_METHODS = frozenset(('ren_opd', 'ren_graft', 'causal_topk', 'union_topk', 'vanilla_opd'))
 
 
 def _integers(value, name, *, nonempty=False):
@@ -51,11 +51,14 @@ def sanitize_score_request(request, method, *, vocab_size=None, max_sequence_tok
         raise ValueError('Teacher records must be a sequence')
     result = []
     for record in request['records']:
-        required = (_RECORD_KEYS - {'correction_ids'}
-                    if method in ('vanilla_opd', 'ren_weighted_opd') else _RECORD_KEYS)
-        allowed = required if method == 'ren_weighted_opd' else _RECORD_KEYS
+        if method in ('vanilla_opd', 'ren_opd'):
+            required = {'causal_prompt_ids', 'response_ids', 'positions'}
+            allowed = required
+        else:
+            required = {'causal_prompt_ids', 'response_ids', 'positions', 'correction_ids'}
+            allowed = required
         if not isinstance(record, dict) or not required <= set(record) <= allowed:
-            raise ValueError('Teacher record contains missing or forbidden fields; only causal tokens and candidate IDs are allowed')
+            raise ValueError('Teacher record contains missing or forbidden fields; only causal tokens and required candidate IDs are allowed')
         prompt = _integers(record['causal_prompt_ids'], 'causal_prompt_ids', nonempty=True)
         response = _integers(record['response_ids'], 'response_ids')
         positions = _integers(record['positions'], 'positions')
@@ -69,11 +72,11 @@ def sanitize_score_request(request, method, *, vocab_size=None, max_sequence_tok
         if 'correction_ids' in record:
             ids = torch.as_tensor(record['correction_ids'])
             if ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
-                raise ValueError('Teacher correction_ids must be integer tensors')
+                raise ValueError('Teacher correction_ids must be an integer tensor')
             if ids.ndim != 2 or ids.shape[0] != len(positions):
                 raise ValueError('Teacher correction_ids must have shape [reasoning_positions, candidates]')
             if bool((ids < -1).any()) or (vocab_size is not None and bool((ids >= vocab_size).any())):
-                raise ValueError('Teacher correction_ids must be -1 padding or valid vocabulary IDs')
+                raise ValueError('Teacher correction_ids contains invalid vocabulary IDs')
             clean['correction_ids'] = ids.detach().to(device='cpu', dtype=torch.long).contiguous()
         result.append(clean)
     return {'op': 'score', 'round': round_index, 'request_id': request_id, 'records': result}
@@ -107,7 +110,10 @@ def score_records(model, tokenizer, records, args):
         states = training.selected_hidden(model, tokenizer, batch, 'causal_prompt_ids', args)
         for record, hidden in zip(batch, states):
             hidden = _full_tensor(hidden)
-            if args.method in ('vanilla_opd', 'ren_weighted_opd'):
+            if args.method in ('vanilla_opd', 'ren_opd'):
+                # ReN keeps the Teacher strictly answer-blind: recognition IDs
+                # never cross this service boundary.  The Student update combines
+                # these causal Teacher states with locally cached hindsight Top-K.
                 result.append({'teacher_hidden': hidden.detach().cpu().contiguous(), 'teacher_scored': True})
                 continue
             chunks = []
@@ -218,7 +224,7 @@ def teacher_worker(args, rank, world, device_ids, address, port, conn):
                  'backend': 'transformers_tp' if world > 1 else 'transformers',
                  'tp_reductions': 'synchronous_rowwise' if world > 1 else None,
                  'seconds': time.monotonic() - started}
-        if args.method in ('vanilla_opd', 'ren_weighted_opd'):
+        if args.method in ('vanilla_opd', 'ren_opd'):
             # All TP ranks participate should a future head itself be sharded.
             head = model.get_output_embeddings()
             weight = _full_tensor(head.weight.detach()).cpu().contiguous()

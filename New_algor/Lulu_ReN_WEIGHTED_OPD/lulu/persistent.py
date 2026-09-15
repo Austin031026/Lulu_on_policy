@@ -33,7 +33,7 @@ from lulu.checkpoints import CheckpointManager
 
 
 def allocate_roles(a):
-    needs_h = a.method in ('ren_opd', 'ren_weighted_opd', 'opsd', 'union_topk')
+    needs_h = a.method in ('ren_opd', 'ren_graft', 'opsd', 'union_topk')
     needs_t = a.method != 'opsd'
     if a.cpu:
         return {'student': [], 'hindsight': [] if needs_h else None,
@@ -144,7 +144,7 @@ def collect_batches(student, tok, rows, a, rank, world):
                         r['student_hidden'] = h.detach().to('cpu', copy=True)
                     payload = {key: r[key] for key in ('index', 'causal_prompt_ids',
                                'hindsight_prompt_ids', 'response_ids', 'positions')}
-                    if a.method in ('ren_opd', 'causal_topk', 'union_topk'):
+                    if a.method in ('ren_graft', 'causal_topk', 'union_topk'):
                         topk = [head(h[pos:pos+a.logit_chunk_size]).float().topk(k, -1).indices.cpu()
                                 for pos in range(0, len(h), a.logit_chunk_size)]
                         payload['causal_topk_ids'] = torch.cat(topk) if topk else torch.empty((0, k), dtype=torch.long)
@@ -195,7 +195,9 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
     if not torch.isfinite(loss_sum):
         raise FloatingPointError('Non-finite distillation loss')
     optimizer.step()
-    return {'round': a.round, 'completed_updates': a.round+1, 'forward_kl': loss_sum.item()/active,
+    objective_value = loss_sum.item()/active
+    return {'round': a.round, 'completed_updates': a.round+1, 'objective_loss': objective_value,
+            'forward_kl': objective_value,  # legacy field name kept for older analysis scripts
             'grad_norm': grad.item(), 'reasoning_tokens': positions, 'supervised_trajectories': active,
             'trajectories': expected, 'update_seconds': time.monotonic()-started}
 
@@ -204,6 +206,9 @@ def student_worker(a, rank, world, ids, port, conn):
     try:
         _configure(ids, rank, world)
         device = tr.device_for(a)
+        if world > 1:
+            dist.init_process_group('gloo' if a.cpu else 'nccl', init_method=f'tcp://127.0.0.1:{port}',
+                                    rank=rank, world_size=world)
         tr.seed_all(a.seed)
         initial = Path(a.initial_checkpoint) if a.initial_checkpoint else None
         student = tr.load_student(a, initial, trainable=True)
@@ -221,13 +226,6 @@ def student_worker(a, rank, world, ids, port, conn):
         head = tr.base_model(student).get_output_embeddings()
         frozen_head = copy.deepcopy(head).requires_grad_(False) if any(p.requires_grad for p in head.parameters()) else head
         step_model = tr.DistillationStep(student, frozen_head, None, tok, a)
-        # Load a resumed PEFT adapter before initializing torch.distributed.
-        # PEFT otherwise treats Qwen's TP metadata as active tensor parallelism
-        # and enters a Transformers TP compatibility path even though these
-        # Student ranks use ordinary DDP.
-        if world > 1:
-            dist.init_process_group('gloo' if a.cpu else 'nccl', init_method=f'tcp://127.0.0.1:{port}',
-                                    rank=rank, world_size=world)
         distributed = DDP(step_model, device_ids=[device.index] if device.type == 'cuda' else None,
                           broadcast_buffers=False) if world > 1 else step_model
         manager = CheckpointManager(a.output_dir, a.save_every) if rank == 0 else None
@@ -601,7 +599,7 @@ def run_persistent(a):
             workers.expect(conn, 'ready')
         if teacher:
             ready = workers.expect(teacher, 'ready')
-            if a.method in ('vanilla_opd', 'ren_weighted_opd'):
+            if a.method in ('vanilla_opd', 'ren_opd'):
                 for conn in students:
                     conn.send({'op': 'teacher_head', 'state': ready['teacher_head']})
                 for conn in students:

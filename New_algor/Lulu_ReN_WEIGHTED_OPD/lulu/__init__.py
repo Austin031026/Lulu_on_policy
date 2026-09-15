@@ -5,14 +5,7 @@ usable without importing torch or any training dependency.
 """
 from importlib import import_module
 
-__all__ = [
-    'build_cached_target',
-    'build_target',
-    'forward_kl',
-    'probability_mass_at_ids',
-    'recognition_weighted_forward_kl',
-    'reduce_position_losses',
-]
+__all__ = ['build_cached_target', 'build_target', 'forward_kl', 'reduce_position_losses']
 
 
 def __getattr__(name):

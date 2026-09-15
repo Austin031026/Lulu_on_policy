@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lulu-ren-opd"
+version = "0.1.0"
+description = "Lulu recognizable-novelty on-policy distillation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26,<2.0",
+  "pyarrow>=15",
+  "torch==2.7.0",
+  "transformers==4.52.4",
+  "tokenizers==0.21.4",
+  "peft==0.20.0",
+  "datasets>=3.0",
+]
+
+[project.optional-dependencies]
+eval = [
+  "sympy>=1.12",
+  "regex>=2024.0",
+  "word2number>=1.1",
+  "latex2sympy2-extended>=1.11.0",
+]
+test = ["pytest>=8"]
+
+[project.scripts]
+lulu-train = "lulu.training:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lulu*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

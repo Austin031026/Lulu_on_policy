@@ -23,46 +23,47 @@ def _args(method='ren_opd', batch=2, chunk=2):
                            max_sequence_tokens=128, cpu=True, dtype='float32')
 
 
-def _request(round_index=0, request_id='0:0'):
-    return {'op': 'score', 'round': round_index, 'request_id': request_id, 'records': [
-        {'causal_prompt_ids': [3, 4], 'response_ids': [6, 7, 8, 9], 'positions': [0, 1, 3],
-         'correction_ids': torch.tensor([[0, 6, -1], [30, 2, 7], [-1, -1, -1]])},
-        {'causal_prompt_ids': [3, 5, 10], 'response_ids': [12, 13], 'positions': [],
-         'correction_ids': torch.empty((0, 3), dtype=torch.long)},
-        {'causal_prompt_ids': [3, 5, 11], 'response_ids': [12, 13, 14], 'positions': [0, 2],
-         'correction_ids': torch.tensor([[4, 1, 2], [7, -1, 3]])},
-    ]}
+def _request(round_index=0, request_id='0:0', method='ren_opd'):
+    records = [
+        {'causal_prompt_ids': [3, 4], 'response_ids': [6, 7, 8, 9], 'positions': [0, 1, 3]},
+        {'causal_prompt_ids': [3, 5, 10], 'response_ids': [12, 13], 'positions': []},
+        {'causal_prompt_ids': [3, 5, 11], 'response_ids': [12, 13, 14], 'positions': [0, 2]},
+    ]
+    if method not in ('vanilla_opd', 'ren_opd'):
+        values = [torch.tensor([[0, 6, -1], [30, 2, 7], [-1, -1, -1]]),
+                  torch.empty((0, 3), dtype=torch.long),
+                  torch.tensor([[4, 1, 2], [7, -1, 3]])]
+        for record, value in zip(records, values):
+            record['correction_ids'] = value
+    return {'op': 'score', 'round': round_index, 'request_id': request_id, 'records': records}
 
 
-def _hidden_request(round_index=0, request_id='0:0'):
-    request = _request(round_index, request_id)
-    for record in request['records']:
-        del record['correction_ids']
-    return request
-
-
-@pytest.mark.parametrize('method', ['ren_opd', 'causal_topk', 'union_topk'])
+@pytest.mark.parametrize('method', ['ren_opd', 'ren_graft', 'causal_topk', 'union_topk'])
 @pytest.mark.parametrize('batch,chunk', [(1, 1), (2, 2), (8, 32)])
 def test_selected_probabilities_equal_dense_teacher_softmax(method, batch, chunk):
     model, tok, args = _model(), SimpleNamespace(pad_token_id=0), _args(method, batch, chunk)
-    records = teacher_service.sanitize_score_request(_request(), method, vocab_size=31)['records']
+    records = teacher_service.sanitize_score_request(_request(method=method), method, vocab_size=31)['records']
     actual = teacher_service.score_records(model, tok, records, args)
     with torch.inference_mode():
         hidden = training.selected_hidden(model, tok, records, 'causal_prompt_ids', args)
         for record, states, result in zip(records, hidden, actual):
             probabilities = model.get_output_embeddings()(states).float().softmax(-1)
-            ids = record['correction_ids']
-            expected = probabilities.gather(-1, ids.clamp_min(0)).masked_fill(ids < 0, 0)
-            torch.testing.assert_close(result['teacher_probs'], expected, atol=1e-7, rtol=1e-6)
-            assert result['teacher_probs'].device.type == 'cpu'
-            assert result['teacher_probs'].dtype == torch.float32
-            assert not result['teacher_probs'].requires_grad
+            if method == 'ren_opd':
+                torch.testing.assert_close(result['teacher_hidden'], states)
+                assert 'teacher_probs' not in result
+            else:
+                ids = record['correction_ids']
+                expected = probabilities.gather(-1, ids.clamp_min(0)).masked_fill(ids < 0, 0)
+                torch.testing.assert_close(result['teacher_probs'], expected, atol=1e-7, rtol=1e-6)
+                assert result['teacher_probs'].device.type == 'cpu'
+                assert result['teacher_probs'].dtype == torch.float32
+                assert not result['teacher_probs'].requires_grad
             assert result['teacher_scored'] is True
 
 
 def test_vanilla_hidden_reconstructs_teacher_distribution():
     model, tok, args = _model(), SimpleNamespace(pad_token_id=0), _args('vanilla_opd')
-    request = _hidden_request()
+    request = _request(method='vanilla_opd')
     records = teacher_service.sanitize_score_request(request, args.method)['records']
     actual = teacher_service.score_records(model, tok, records, args)
     with torch.inference_mode():
@@ -70,22 +71,6 @@ def test_vanilla_hidden_reconstructs_teacher_distribution():
     for wanted, result in zip(expected, actual):
         torch.testing.assert_close(result['teacher_hidden'], wanted)
         assert 'teacher_probs' not in result
-
-
-def test_weighted_teacher_returns_hidden_without_receiving_recognition_ids():
-    model, tok, args = _model(), SimpleNamespace(pad_token_id=0), _args('ren_weighted_opd')
-    request = _hidden_request()
-    records = teacher_service.sanitize_score_request(request, args.method)['records']
-    actual = teacher_service.score_records(model, tok, records, args)
-    with torch.inference_mode():
-        expected = training.selected_hidden(model, tok, records, 'causal_prompt_ids', args)
-    for wanted, result in zip(expected, actual):
-        torch.testing.assert_close(result['teacher_hidden'], wanted)
-        assert set(result) == {'teacher_hidden', 'teacher_scored'}
-    forbidden = _hidden_request()
-    forbidden['records'][0]['recognition_ids'] = torch.tensor([[1], [2], [3]])
-    with pytest.raises(ValueError, match='forbidden fields'):
-        teacher_service.sanitize_score_request(forbidden, args.method)
 
 
 @pytest.mark.parametrize('field', ['answer', 'gold_answer', 'hindsight_prompt_ids', 'student_hidden', 'question'])
@@ -108,10 +93,10 @@ def test_teacher_rejects_extra_fields_instead_of_silently_receiving_gold(field):
     lambda r: r['records'][0].update(causal_prompt_ids=[31]),
 ])
 def test_teacher_validates_shapes_positions_and_ids(change):
-    request = _request()
+    request = _request(method='ren_graft')
     change(request)
     with pytest.raises(ValueError):
-        teacher_service.sanitize_score_request(request, 'ren_opd', vocab_size=31)
+        teacher_service.sanitize_score_request(request, 'ren_graft', vocab_size=31)
 
 
 def test_teacher_refuses_silent_context_truncation():
@@ -162,15 +147,6 @@ def test_vanilla_head_transferred_once_at_ready(monkeypatch):
     model, calls = _mock_loader(monkeypatch)
     conn = _Connection([_request(), _request(1, '1:0'), {'op': 'stop'}])
     teacher_service.teacher_worker(_args('vanilla_opd'), 0, 1, [], '127.0.0.1', 12345, conn)
-    torch.testing.assert_close(conn.replies[0]['teacher_head']['weight'], model.get_output_embeddings().weight)
-    assert all('teacher_head' not in result for result in conn.replies[1:])
-    assert len(calls) == 1
-
-
-def test_weighted_head_transferred_once_at_ready(monkeypatch):
-    model, calls = _mock_loader(monkeypatch)
-    conn = _Connection([_hidden_request(), _hidden_request(1, '1:0'), {'op': 'stop'}])
-    teacher_service.teacher_worker(_args('ren_weighted_opd'), 0, 1, [], '127.0.0.1', 12345, conn)
     torch.testing.assert_close(conn.replies[0]['teacher_head']['weight'], model.get_output_embeddings().weight)
     assert all('teacher_head' not in result for result in conn.replies[1:])
     assert len(calls) == 1

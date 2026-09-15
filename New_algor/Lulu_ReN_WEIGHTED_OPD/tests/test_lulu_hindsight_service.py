@@ -53,7 +53,7 @@ def _records(model):
     return records, tok
 
 
-@pytest.mark.parametrize('method', ['ren_opd', 'ren_weighted_opd', 'union_topk', 'opsd', 'causal_topk', 'vanilla_opd'])
+@pytest.mark.parametrize('method', ['ren_opd', 'ren_graft', 'union_topk', 'opsd', 'causal_topk', 'vanilla_opd'])
 @pytest.mark.parametrize('chunk', [1, 20])
 def test_hindsight_results_equal_dense_forward_without_exposing_prompts(method, chunk):
     model = _student().eval().requires_grad_(False)
@@ -68,17 +68,17 @@ def test_hindsight_results_equal_dense_forward_without_exposing_prompts(method, 
             elif method == 'opsd':
                 torch.testing.assert_close(actual['student_hidden'], hidden)
                 assert actual['student_hidden'].device.type == 'cpu'
-            elif method == 'ren_weighted_opd':
-                expected = training.base_model(model).get_output_embeddings()(hidden).topk(4).indices
-                torch.testing.assert_close(actual['recognition_ids'], expected)
-                assert actual['recognition_ids'].device.type == 'cpu'
             else:
                 cs = record['causal_topk_ids']
                 hs = training.base_model(model).get_output_embeddings()(hidden).topk(4).indices
-                novel = hs.masked_fill(hs.unsqueeze(-1).eq(cs.unsqueeze(-2)).any(-1), -1)
-                expected = cs if method == 'causal_topk' else torch.cat((cs, novel), -1) if method == 'union_topk' else novel
-                torch.testing.assert_close(actual['correction_ids'], expected)
-                assert actual['correction_ids'].device.type == 'cpu'
+                if method == 'ren_opd':
+                    torch.testing.assert_close(actual['recognition_ids'], hs)
+                    assert actual['recognition_ids'].device.type == 'cpu'
+                else:
+                    novel = hs.masked_fill(hs.unsqueeze(-1).eq(cs.unsqueeze(-2)).any(-1), -1)
+                    expected = cs if method == 'causal_topk' else torch.cat((cs, novel), -1) if method == 'union_topk' else novel
+                    torch.testing.assert_close(actual['correction_ids'], expected)
+                    assert actual['correction_ids'].device.type == 'cpu'
 
 
 @pytest.mark.parametrize('lora', [False, True])
