@@ -49,7 +49,8 @@ def parser():
     p.add_argument("--top-k", type=int, default=32)
     p.add_argument("--logit-chunk-size", type=int, default=32)
     p.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
-    p.add_argument("--lora-rank", type=int, default=16)
+    p.add_argument("--lora-rank", type=int, default=0,
+                   help="LoRA rank; 0 (default) profiles full-parameter Student training")
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-target-modules",
                    default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")

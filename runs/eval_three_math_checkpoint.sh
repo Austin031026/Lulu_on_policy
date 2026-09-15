@@ -10,8 +10,9 @@ fi
 set -uo pipefail
 
 main() {
-  local run_dir root_dir workspace_root checkpoint requested_checkpoint checkpoint_name
+  local run_dir root_dir workspace_root checkpoint requested_checkpoint checkpoint_name checkpoint_type
   local python_bin source_root data_dir manifest output_root stamp output_dir log_file info_file
+  local full_checkpoint lora_checkpoint
 
   run_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   root_dir="$(cd "$run_dir/.." && pwd)"
@@ -21,6 +22,7 @@ main() {
   source_root="${EVAL_JSON_ROOT:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu_outputs/ren_distill/qwen17b_final_5k/eval_data/math}"
   data_dir="${EVAL_PARQUET_ROOT:-$workspace_root/data/lulu_offline_math_eval}"
   output_root="${LULU_OUTPUT_ROOT:-$workspace_root/Lulu_outputs}"
+  checkpoint_type="${CHECKPOINT_TYPE:-full}"
 
   if [[ -z "$checkpoint" ]]; then
     echo "Missing checkpoint path."
@@ -32,10 +34,25 @@ main() {
     echo "Checkpoint directory does not exist: $requested_checkpoint"
     return 2
   }
-  if [[ ! -f "$checkpoint/adapter_config.json" && ! -f "$checkpoint/config.json" ]]; then
-    echo "Checkpoint must contain adapter_config.json or config.json: $checkpoint"
-    return 2
-  fi
+  full_checkpoint=""
+  lora_checkpoint=""
+  case "$checkpoint_type" in
+    full)
+      if [[ ! -f "$checkpoint/config.json" || -f "$checkpoint/adapter_config.json" ]]; then
+        echo "Expected a full-model checkpoint with config.json: $checkpoint"
+        return 2
+      fi
+      full_checkpoint="$checkpoint"
+      ;;
+    lora)
+      if [[ ! -f "$checkpoint/adapter_config.json" || ( ! -f "$checkpoint/adapter_model.safetensors" && ! -f "$checkpoint/adapter_model.bin" ) ]]; then
+        echo "Expected a complete LoRA adapter checkpoint: $checkpoint"
+        return 2
+      fi
+      lora_checkpoint="$checkpoint"
+      ;;
+    *) echo "CHECKPOINT_TYPE must be full or lora: $checkpoint_type"; return 2 ;;
+  esac
   if [[ ! -x "$python_bin" ]]; then
     echo "Python executable is invalid: $python_bin"
     return 2
@@ -84,6 +101,7 @@ PY
   info_file="${EVAL_INFO_FILE:-$output_root/logs/latest_three_math_eval.info}"
 
   echo "[lulu-eval] checkpoint=$checkpoint"
+  echo "[lulu-eval] checkpoint_type=$checkpoint_type"
   echo "[lulu-eval] benchmarks=math500,olympiadbench,aime25"
   echo "[lulu-eval] gpus=${GPUS:-0,1,2,4,5,6,7} batch_size=${BATCH_SIZE:-8}"
   echo "[lulu-eval] output=$output_dir"
@@ -98,7 +116,9 @@ PY
     TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}" \
     HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
     MODEL="${MODEL:-Qwen/Qwen3-1.7B}" \
-    CHECKPOINT="$checkpoint" \
+    CHECKPOINT="" \
+    FULL_CHECKPOINT="$full_checkpoint" \
+    LORA_CHECKPOINT="$lora_checkpoint" \
     CHECKPOINT_NAME="$checkpoint_name" \
     INCLUDE_BASE="${INCLUDE_BASE:-0}" \
     DATA_MANIFEST="$manifest" \

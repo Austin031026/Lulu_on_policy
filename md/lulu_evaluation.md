@@ -10,7 +10,7 @@
 export PYTHON_BIN="$(command -v python)"
 export DATA_MANIFEST="$(realpath ../Soraka_rlrl/experiments/v6_5-success-q-scale-pool4096-phase11024-seed42/crossbench_v631/data/manifest.json)"
 
-CHECKPOINT=/path/to/lulu-run/checkpoints/step_000100 \
+FULL_CHECKPOINT=/path/to/lulu-run/checkpoints/step_000100 \
 OUTPUT_DIR=/path/to/new-evaluation-dir \
 GPUS=0,1,2,3,4,5,6,7 BATCH_SIZE=8 \
 bash runs/eval_lulu.sh
@@ -18,7 +18,7 @@ bash runs/eval_lulu.sh
 
 普通数学与选择题评测默认以当前 Lulu checkout 为框架根目录，直接加载本仓库的 runner 和 parser，不需要设置 `LULU_SORAKA_ROOT`。`--soraka-root`/`LULU_SORAKA_ROOT` 仅保留为显式兼容覆盖。launcher 不改变当前目录，所以相对 `CHECKPOINT`、`DATA_MANIFEST` 和 `OUTPUT_DIR` 均相对调用时的工作目录。
 
-Persistent 后端中，`step_000000` 是初始化 checkpoint，`step_000001` 是第一次 optimizer update 后的 Student；旧 staged 后端使用 `round_XXXX` 命名。`CHECKPOINT` 指向含 `adapter_config.json` 和 tokenizer 的 checkpoint 目录，也支持完整 HF 模型目录。无需合并 adapter。`MODEL` 默认是 `Qwen/Qwen3-1.7B`，更换 Student 时一并设置，用于 base 对照。迁移 adapter 后若内部 base 路径失效，可追加 `--adapter-base-model /new/base/path`。
+Persistent 后端中，`step_000000` 是初始化 checkpoint，`step_000001` 是第一次 optimizer update 后的 Student；旧 staged 后端使用 `round_XXXX` 命名。新训练默认产生包含 `config.json` 和完整权重的 Hugging Face 模型目录，使用 `FULL_CHECKPOINT` 或 `--full-checkpoint` 加载。历史 LoRA run 使用 `LORA_CHECKPOINT` 或 `--lora-checkpoint` 加载，目录必须包含 adapter 配置与权重。旧 `CHECKPOINT`/`--checkpoint` 只作为自动识别兼容入口。`MODEL` 默认是 `Qwen/Qwen3-1.7B`，用于 base 对照；迁移 LoRA adapter 后若内部 base 路径失效，可追加 `--adapter-base-model /new/base/path`。完整命令见 [全参数训练与分类型 checkpoint 测评](lulu_full_parameter_training_and_evaluation.md)。
 
 默认同时评测 base 和指定 checkpoint。上述现有 manifest 的 `full` 包含：
 
@@ -43,7 +43,7 @@ Persistent 后端中，`step_000000` 是初始化 checkpoint，`step_000001` 是
 DRY_RUN=1 GPUS=0,1,2,3 bash runs/eval_lulu.sh
 
 # 快速检查：只用 general reasoning 的 probe split。
-CHECKPOINT=/path/to/lulu-run/checkpoints/step_000001 \
+FULL_CHECKPOINT=/path/to/lulu-run/checkpoints/step_000001 \
 OUTPUT_DIR=/path/to/new-probe-dir \
 BENCHMARKS=mmlu_pro,gpqa_diamond SPLIT=probe \
 MAX_EXAMPLES=16 MAX_RESPONSE_TOKENS=1024 \
@@ -71,9 +71,9 @@ bash runs/eval_lulu_checkpoints.sh
 ```bash
 "$PYTHON" scripts/evaluate_lulu.py \
   --model Qwen/Qwen3-1.7B --include-base \
-  --checkpoint ren=/path/ren/checkpoints/step_000100 \
-  --checkpoint opd=/path/vanilla-opd/checkpoints/step_000100 \
-  --checkpoint opsd=/path/opsd/checkpoints/step_000100 \
+  --full-checkpoint ren=/path/ren/checkpoints/step_000100 \
+  --full-checkpoint opd=/path/vanilla-opd/checkpoints/step_000100 \
+  --lora-checkpoint opsd=/path/opsd/checkpoints/step_000100 \
   --data-manifest "$DATA_MANIFEST" \
   --output-dir /path/to/new-comparison-dir \
   --gpus 0,1,2,3,4,5,6,7 --batch-size 8

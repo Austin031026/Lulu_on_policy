@@ -10,7 +10,7 @@ fi
 set -uo pipefail
 
 main() {
-  local run_dir root_dir workspace_root checkpoint requested python_bin
+  local run_dir root_dir workspace_root checkpoint requested python_bin checkpoint_type
   local source_root external_root output_root label stamp output_dir log_file info_file
   run_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   root_dir="$(cd "$run_dir/.." && pwd)"
@@ -20,6 +20,7 @@ main() {
   source_root="${EVAL_JSON_ROOT:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu_outputs/ren_distill/qwen17b_final_5k/eval_data/math}"
   external_root="${LULU_OFFLINE_EVAL_ROOT:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu}"
   output_root="${LULU_OUTPUT_ROOT:-$workspace_root/Lulu_outputs}"
+  checkpoint_type="${CHECKPOINT_TYPE:-full}"
 
   if [[ -z "$requested" ]]; then
     echo "Usage: bash runs/eval_three_math_checkpoint_vllm.sh /absolute/path/to/checkpoint"
@@ -29,18 +30,31 @@ main() {
     echo "Checkpoint directory does not exist: $requested"
     return 2
   }
-  if [[ ! -f "$checkpoint/adapter_config.json" && ! -f "$checkpoint/config.json" ]]; then
-    echo "Checkpoint must contain adapter_config.json or config.json: $checkpoint"
-    return 2
-  fi
+  case "$checkpoint_type" in
+    full)
+      if [[ ! -f "$checkpoint/config.json" || -f "$checkpoint/adapter_config.json" ]]; then
+        echo "Expected a full-model checkpoint with config.json: $checkpoint"
+        return 2
+      fi
+      ;;
+    lora)
+      if [[ ! -f "$checkpoint/adapter_config.json" || ( ! -f "$checkpoint/adapter_model.safetensors" && ! -f "$checkpoint/adapter_model.bin" ) ]]; then
+        echo "Expected a complete LoRA adapter checkpoint: $checkpoint"
+        return 2
+      fi
+      ;;
+    *) echo "CHECKPOINT_TYPE must be full or lora: $checkpoint_type"; return 2 ;;
+  esac
   for file in 11_generate_eval_rollouts.py 02_merge_jsonl.py 03_verify_math_rollouts.py; do
     if [[ ! -f "$external_root/$file" ]]; then
       echo "Missing reusable offline evaluator file: $external_root/$file"
       return 2
     fi
   done
-  if ! "$python_bin" -c 'import torch, transformers, peft, vllm, math_verify' >/dev/null; then
-    echo "Python environment is missing torch/transformers/peft/vllm/math_verify: $python_bin"
+  required_modules='import torch, transformers, vllm, math_verify'
+  [[ "$checkpoint_type" != lora ]] || required_modules='import torch, transformers, peft, vllm, math_verify'
+  if ! "$python_bin" -c "$required_modules" >/dev/null; then
+    echo "Python environment is missing dependencies for $checkpoint_type evaluation: $python_bin"
     return 2
   fi
 
@@ -52,6 +66,7 @@ main() {
   mkdir -p "$output_root/evaluation" "$output_root/evaluation_models" "$output_root/logs"
 
   echo "[lulu-vllm] checkpoint=$checkpoint"
+  echo "[lulu-vllm] checkpoint_type=$checkpoint_type"
   echo "[lulu-vllm] engine=vllm n=${NUM_ROLLOUTS:-4} questions_per_gpu_batch=${BATCH_SIZE:-8}"
   echo "[lulu-vllm] gpus=${GPUS:-0,1,2,4,5,6,7} max_examples_per_benchmark=${MAX_EXAMPLES:-0}"
   echo "[lulu-vllm] output=$output_dir"
@@ -63,7 +78,7 @@ main() {
     TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}" \
     HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
     "$python_bin" -u "$root_dir/scripts/evaluate_three_math_vllm.py" \
-      --checkpoint "$checkpoint" --checkpoint-name "$label" \
+      --checkpoint "$checkpoint" --checkpoint-type "$checkpoint_type" --checkpoint-name "$label" \
       --source-root "$source_root" --external-root "$external_root" \
       --output-dir "$output_dir" --merged-model-root "$output_root/evaluation_models" \
       --python "$python_bin" --gpus "${GPUS:-0,1,2,4,5,6,7}" \

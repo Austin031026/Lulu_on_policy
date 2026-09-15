@@ -41,11 +41,23 @@ def checkpoint_digest(checkpoint):
     return digest.hexdigest()
 
 
-def resolve_model(checkpoint, merged_root, base_model=None):
-    if (checkpoint / "config.json").is_file() and not (checkpoint / "adapter_config.json").is_file():
+def resolve_model(checkpoint, merged_root, base_model=None, checkpoint_type="auto"):
+    if checkpoint_type not in {"auto", "full", "lora"}:
+        raise ValueError(f"unknown checkpoint type: {checkpoint_type}")
+    has_full_config = (checkpoint / "config.json").is_file()
+    has_adapter = (checkpoint / "adapter_config.json").is_file()
+    has_adapter_weights = any((checkpoint / name).is_file() for name in
+                              ("adapter_model.safetensors", "adapter_model.bin"))
+    if checkpoint_type == "auto":
+        checkpoint_type = "lora" if has_adapter else "full"
+    if checkpoint_type == "full":
+        if has_adapter:
+            raise ValueError(f"declared full-model checkpoint contains adapter_config.json: {checkpoint}")
+        if not has_full_config:
+            raise ValueError(f"declared full-model checkpoint has no config.json: {checkpoint}")
         return checkpoint
-    if not (checkpoint / "adapter_config.json").is_file():
-        raise ValueError(f"checkpoint is neither a full HF model nor a PEFT adapter: {checkpoint}")
+    if not has_adapter or not has_adapter_weights:
+        raise ValueError(f"declared LoRA checkpoint is incomplete: {checkpoint}")
 
     digest = checkpoint_digest(checkpoint)
     destination = merged_root / f"{checkpoint.name}_{digest[:12]}"
@@ -165,6 +177,7 @@ def summarize(path, expected_n):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint-type", choices=("full", "lora", "auto"), default="full")
     parser.add_argument("--checkpoint-name", required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--external-root", type=Path, required=True)
@@ -211,7 +224,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "logs").mkdir()
     args.merged_model_root.mkdir(parents=True, exist_ok=True)
-    model = resolve_model(args.checkpoint, args.merged_model_root, args.base_model)
+    model = resolve_model(args.checkpoint, args.merged_model_root, args.base_model, args.checkpoint_type)
 
     plan = vars(args).copy()
     plan["gpus"] = args.gpus

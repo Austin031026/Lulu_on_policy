@@ -41,6 +41,8 @@ ReN 只启用明确的 `<think>...</think>` reasoning span，支持 token 上限
 
 默认 `--pointwise-kl-clip 0.05`：在对词表求和前，将每个 vocabulary entry 的 forward-KL contribution 上限裁剪为 0.05，与 OPSD Thinking 配置的默认值一致；设为 0 可关闭以做消融。这不是整个位点 KL clipping，也不是更新前后 Student 的 trust-region 约束。
 
+`--kl-direction forward|reverse` 选择优化 `KL(target||Student)` 或 `KL(Student||target)`；默认仍为 forward，旧实验语义不变。Reverse 使用同一个 ReN target、数据、采样和 pointwise clip，并自动记录同一批 reasoning positions 上的 forward/reverse shadow KL。`--kl-diagnostics` 也可用于 forward 实验：它按 `--kl-diagnostic-thresholds` 在线精确累计每个词表 contribution 的超阈值数量、比例和被裁掉的正 contribution 质量，不保存巨大的 token×vocabulary 张量。使用 `scripts/analyze_kl_diagnostics.py` 汇总 KL 曲线与 clip tail 分布。完整定义和实验命令见 [`md/lulu_reverse_kl.md`](md/lulu_reverse_kl.md)。
+
 新增的 `ren_weighted_opd` 是独立可选模式，不改变 `ren_opd`：对每个 reasoning 位置取 `H=TopK(pH)`，计算 `alpha=qT(H)`，训练目标为 `alpha*KL(qT||pθ)+(1-alpha)*KL(pC||pθ)`。hindsight 只决定识别集合，Teacher 仍只接收 causal prompt 和 sampled prefix。首次加权实验明确传 `--pointwise-kl-clip 0`，保留截断功能但先关闭；之后可传正数做 clip 消融。文档入口见 [`md/lulu_algorithm_overview.md`](md/lulu_algorithm_overview.md)。
 
 默认每轮一整个 rollout batch、一次全局 optimizer update，然后刷新快照和 rollout。常驻后端只接受 `--update-passes 1`：本轮全部轨迹和 target 准备完成后才进入 DDP update，下一轮必须等待更新与 hindsight 权重同步完成。优化器状态跨 round 常驻；断点续训从完整 checkpoint 恢复，未完成 round 重新采样、评分。旧的 `--backend staged` 仍支持多次 update-passes，但后续更新使用的是本轮旧快照采样的轨迹。
@@ -67,7 +69,7 @@ Frozen hidden states 留在各 Student 进程内存中，稀疏 Teacher probabil
 
 当前 Torch 2.7 / Transformers 4.52.4 下，Teacher TP 的 rowwise 输出归约显式同步完成；矩阵仍按原生 TP plan 分片。此前较大 GPU batch 出现过 collective 超时，已应用该规避方案，并通过 CPU 双进程 8192-token 投影对照检查；该修复尚未重做大型 GPU 验证。
 
-默认 LoRA rank16、dropout0；`--lora-rank 0` 支持全参数更新。Student/Teacher 必须有相同 tokenizer token→ID 映射和 output vocabulary size，不相容时明确报错。
+默认 `--lora-rank 0`，对 Student 全部参数进行更新；传入正数（例如 `--lora-rank 16`）才启用 LoRA。Student/Teacher 必须有相同 tokenizer token→ID 映射和 output vocabulary size，不相容时明确报错。训练模式和 checkpoint 格式会写入运行计划及 checkpoint 元数据。
 
 需要复现旧实验、查看磁盘缓存或复用同一轮轨迹多次更新时，使用 `--backend staged`。该后端仍是 collect → Teacher → update 子进程阶段，每轮重新加载模型，Teacher 使用 HF 层分片；`--teacher-workers`、`--teacher-memory-gib` 和 `--keep-round-cache` 用于此模式。常驻后端不接受 `--keep-round-cache`。
 
@@ -147,7 +149,7 @@ LULU_BATCH_PROFILE=../LuLu_outputs/lulu_batch_profile.json \
 
 去掉 `--dry-run` 开始训练；同命令加 `--resume` 恢复。恢复要求模型、训练配置和 train.jsonl 的 SHA256 一致；输入/输出路径的写法以及保存间隔可调整，原始 run_config.json 不会被重写。常驻后端从原子发布的 `checkpoints/latest` 恢复完整 Student 和 optimizer；历史 staged 实验应显式使用 `--backend staged` 续训，不能直接切换后端复用其运行目录。
 
-`--save-every 20` 默认保留初始化、每 20 次 optimizer update 的节点、最终节点和最新版本。**latest 仍在每次更新后写入**；减少的是历史文件数量，不代表磁盘写入频率降低 20 倍。保存成功后才切换 latest 并清理旧的非保留节点，失败不会损坏此前 latest。默认 LoRA 的保存量较小，全参数更新的 checkpoint I/O 会明显增加。
+`--save-every 20` 默认保留初始化、每 20 次 optimizer update 的节点、最终节点和最新版本。**latest 仍在每次更新后写入**；减少的是历史文件数量，不代表磁盘写入频率降低 20 倍。保存成功后才切换 latest 并清理旧的非保留节点，失败不会损坏此前 latest。默认全参数更新会保存完整模型和 optimizer，checkpoint I/O 与磁盘占用明显高于 LoRA。
 
 Qwen3-32B 未在本机已检查的 cache 中，需要先提供其本地路径／缓存，或取消离线模式使 HF 正常下载。可显式换 `--teacher-model Qwen/Qwen3-14B` 使用已缓存模型；不会静默替换 Teacher。32B 的完整训练耗时尚未实测。
 
@@ -181,11 +183,11 @@ Qwen3-32B 未在本机已检查的 cache 中，需要先提供其本地路径／
 
 ## Evaluation
 
-详见 [LuLu evaluation 说明](md/lulu_evaluation.md)。默认套件同时含数学与 general reasoning：MATH500、AIME25、OlympiadBench、MMLU-Pro、GPQA Diamond。支持可选 LiveCodeBench 官方评分、任意已有 benchmark Parquet、多 checkpoint 与 base 配对比较。
+详见 [LuLu evaluation 说明](md/lulu_evaluation.md)。 全参数训练默认值以及全模型/LoRA 分离的测评命令见 [全参数训练与分类型 checkpoint 测评](md/lulu_full_parameter_training_and_evaluation.md)。默认套件同时含数学与 general reasoning：MATH500、AIME25、OlympiadBench、MMLU-Pro、GPQA Diamond。支持可选 LiveCodeBench 官方评分、任意已有 benchmark Parquet、多 checkpoint 与 base 配对比较。
 
 ```bash
 export DATA_MANIFEST=../Soraka_rlrl/experiments/v6_5-success-q-scale-pool4096-phase11024-seed42/crossbench_v631/data/manifest.json
-export CHECKPOINT=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest
+export FULL_CHECKPOINT=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest
 export OUTPUT_DIR=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/evaluation
 PYTHON="$PYTHON_BIN" GPUS=0,1,2,4,5,6,7 BATCH_SIZE=8 bash runs/eval_lulu.sh
 ```
@@ -195,7 +197,7 @@ PYTHON="$PYTHON_BIN" GPUS=0,1,2,4,5,6,7 BATCH_SIZE=8 bash runs/eval_lulu.sh
 对一个 checkpoint 运行固定的 Math500、OlympiadBench、AIME2025 套件时，只需传入 checkpoint：
 
 ```bash
-bash runs/eval_three_math_checkpoint.sh /absolute/path/to/checkpoints/step_000020
+bash runs/eval_three_math_full_checkpoint.sh /absolute/path/to/checkpoints/step_000020
 ```
 
 该入口自动复用既有离线 JSONL，首次运行时由本仓库脚本转成 Parquet；默认使用 GPU `0,1,2,4,5,6,7`、单卡 8 道题、Thinking Mode 和 greedy 单 rollout。可通过 `BATCH_SIZE`、`GPUS`、`MAX_RESPONSE_TOKENS` 覆盖。
@@ -205,7 +207,7 @@ bash runs/eval_three_math_checkpoint.sh /absolute/path/to/checkpoints/step_00002
 ```bash
 GPUS=0 BATCH_SIZE=8 MAX_EXAMPLES=8 \
 OUTPUT_DIR=/path/to/empty/smoke-output \
-bash runs/eval_three_math_checkpoint.sh /absolute/path/to/checkpoints/step_000020
+bash runs/eval_three_math_full_checkpoint.sh /absolute/path/to/checkpoints/step_000020
 ```
 
 需要沿用离线数学评测的 vLLM、每题 4 条采样和 Pass@4 口径时，使用专用入口：
@@ -213,11 +215,11 @@ bash runs/eval_three_math_checkpoint.sh /absolute/path/to/checkpoints/step_00002
 ```bash
 # 单卡 smoke：三个 benchmark 各取 8 题，共生成 24 × 4 条轨迹
 GPUS=0 BATCH_SIZE=8 MAX_EXAMPLES=8 \
-bash runs/eval_three_math_checkpoint_vllm.sh /absolute/path/to/checkpoints/step_000020
+bash runs/eval_three_math_full_checkpoint_vllm.sh /absolute/path/to/checkpoints/step_000020
 
 # 完整评测：500 + 580 + 30 题，每题 4 条轨迹
 GPUS=0,1,2,4,5,6,7 BATCH_SIZE=8 MAX_EXAMPLES=0 \
-bash runs/eval_three_math_checkpoint_vllm.sh /absolute/path/to/checkpoints/step_000020
+bash runs/eval_three_math_full_checkpoint_vllm.sh /absolute/path/to/checkpoints/step_000020
 ```
 
 该 vLLM 入口、checkpoint 合并、分片调度和汇总属于 Lulu-101；生成及 Math-Verify 复用 `LULU_OFFLINE_EVAL_ROOT` 下已经验证的三个离线脚本。默认输出 Pass@1、Pass@4 与 rollout accuracy。
@@ -226,7 +228,7 @@ DAPO held-out dev 也可直接评测：
 
 ```bash
 "$PYTHON_BIN" scripts/evaluate_lulu.py \
-  --checkpoint ren=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest \
+  --full-checkpoint ren=../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/checkpoints/latest \
   --benchmark dapo_dev=../Soraka_rlrl/data/lulu_dapo/dev_eval.parquet \
   --output-dir ../LuLu_outputs/experiments/lulu_ren_qwen3_1p7b/dapo_dev_eval \
   --gpus 0,1,2,4,5,6,7 --batch-size 8
@@ -255,7 +257,7 @@ DAPO held-out dev 也可直接评测：
 
 当前默认训练是严格 batch on-policy：所有轨迹来自本轮 Student，所有 microbatch 梯度累积完成后才更新一次参数，下一轮同步 hindsight 后重新采样。DAPO JSONL 只提供题目和 gold outcome；没有正确性筛选或 Teacher trajectory generation。
 
-100 次更新、`--save-every 20` 的最终保留目录是 `step_000000`、`step_000020`、`step_000040`、`step_000060`、`step_000080`、`step_000100`；训练中额外保留最新节点。每个更新节点包含 optimizer state，没有 microbatch 中间 checkpoint。训练入口没有自动周期评测 hook；可以将多个已保留 `--checkpoint NAME=PATH` 交给 evaluator。训练占用全部 8 卡时，应在训练结束后或另有 GPU 时运行评测。
+100 次更新、`--save-every 20` 的最终保留目录是 `step_000000`、`step_000020`、`step_000040`、`step_000060`、`step_000080`、`step_000100`；训练中额外保留最新节点。每个更新节点包含 optimizer state，没有 microbatch 中间 checkpoint。训练入口没有自动周期评测 hook；全参数节点使用 `--full-checkpoint NAME=PATH`，LoRA 节点使用 `--lora-checkpoint NAME=PATH` 交给 evaluator。训练占用全部 8 卡时，应在训练结束后或另有 GPU 时运行评测。
 
 评测默认 5 个数据集、2640 题/模型，每 GPU 一个常驻进程，每卡默认 batch8，8 GPU 最多同时 64 题。同一模型跨数据集常驻，切换 checkpoint 才换模型；使用普通 HF `generate` 的静态 batch 和 padding，没有 continuous batching、按长度动态组批或生成/CPU 评分流水线。
 

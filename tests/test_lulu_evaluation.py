@@ -35,7 +35,8 @@ class EvaluationPlanTests(unittest.TestCase):
 
     def test_default_suite_includes_general_reasoning_and_relative_paths(self):
         plan = evaluation.build_plan(self.args())
-        self.assertEqual(plan["models"], [{"name": "base", "model": "Qwen/Qwen3-1.7B"}])
+        self.assertEqual(plan["models"], [{"name": "base", "model": "Qwen/Qwen3-1.7B",
+                                                  "checkpoint_type": "full"}])
         self.assertEqual({b["name"] for b in plan["benchmarks"]}, set(evaluation.DEFAULT_BENCHMARKS))
         self.assertIn("mmlu_pro", [b["name"] for b in plan["benchmarks"]])
         self.assertIn("gpqa_diamond", [b["name"] for b in plan["benchmarks"]])
@@ -68,9 +69,9 @@ class EvaluationPlanTests(unittest.TestCase):
     def test_launcher_preserves_caller_relative_paths_from_arbitrary_directory(self):
         (self.root / "student").mkdir()
         env = dict(os.environ)
-        for key in ("DATA_MANIFEST", "EVAL_DATA", "BENCHMARKS", "CHECKPOINT", "LCB_REPO",
-                    "S2T_MATH_PARSER", "S2T_PARSER", "OUTPUT_DIR", "LULU_OUTPUT_ROOT",
-                    "LULU_SORAKA_ROOT"):
+        for key in ("DATA_MANIFEST", "EVAL_DATA", "BENCHMARKS", "CHECKPOINT",
+                    "FULL_CHECKPOINT", "LORA_CHECKPOINT", "LCB_REPO", "S2T_MATH_PARSER",
+                    "S2T_PARSER", "OUTPUT_DIR", "LULU_OUTPUT_ROOT", "LULU_SORAKA_ROOT"):
             env.pop(key, None)
         env.update(PYTHON_BIN=sys.executable, PYTHON="/missing/python", GPUS="cpu",
                    DATA_MANIFEST="manifest.json", CHECKPOINT="student", OUTPUT_DIR="eval-output",
@@ -79,16 +80,27 @@ class EvaluationPlanTests(unittest.TestCase):
                                    cwd=self.root, env=env, check=True, text=True, capture_output=True)
         plan = json.loads(completed.stdout)
         self.assertEqual(plan["output_dir"], str((self.root / "eval-output").resolve()))
-        self.assertEqual(plan["models"], [{"name": "lulu", "model": str((self.root / "student").resolve())}])
+        self.assertEqual(plan["models"], [{"name": "lulu",
+                                                  "model": str((self.root / "student").resolve()),
+                                                  "checkpoint_type": "auto"}])
         self.assertEqual(plan["batch_size"], 16)
         self.assertTrue(all(b["path"] == str((self.root / "data.parquet").resolve())
                             for b in plan["benchmarks"]))
         self.assertFalse((self.root / "eval-output").exists())
 
     def test_named_checkpoints_base_control_and_generation_flags(self):
-        plan = evaluation.build_plan(self.args("--checkpoint", "ren=/tmp/adapter",
-                    "--checkpoint", "opd=/tmp/opd", "--include-base", "--no-thinking", "--max-examples", "3"))
-        self.assertEqual([m["name"] for m in plan["models"]], ["base", "ren", "opd"])
+        adapter = self.root / "adapter"
+        full = self.root / "full"
+        adapter.mkdir(); full.mkdir()
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+        (full / "config.json").write_text("{}")
+        plan = evaluation.build_plan(self.args("--lora-checkpoint", f"ren={adapter}",
+                    "--full-checkpoint", f"opd={full}", "--include-base", "--no-thinking",
+                    "--max-examples", "3"))
+        self.assertEqual([m["name"] for m in plan["models"]], ["base", "opd", "ren"])
+        self.assertEqual([m["checkpoint_type"] for m in plan["models"]],
+                         ["full", "full", "lora"])
         self.assertFalse(plan["thinking"])
         self.assertTrue(all(b["expected_examples"] == 3 for b in plan["benchmarks"]))
 
@@ -96,6 +108,20 @@ class EvaluationPlanTests(unittest.TestCase):
         for value in ("../escape=x", "base=x"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 evaluation.build_plan(self.args("--checkpoint", value, "--include-base"))
+
+    def test_explicit_checkpoint_types_reject_mismatched_local_directories(self):
+        full = self.root / "full"
+        lora = self.root / "lora"
+        full.mkdir(); lora.mkdir()
+        (full / "config.json").write_text("{}")
+        (lora / "adapter_config.json").write_text("{}")
+        (lora / "adapter_model.safetensors").write_bytes(b"weights")
+        self.assertEqual(evaluation.resolve_checkpoint_type(str(full), "full"), "full")
+        self.assertEqual(evaluation.resolve_checkpoint_type(str(lora), "lora"), "lora")
+        with self.assertRaisesRegex(ValueError, "declared full-model checkpoint"):
+            evaluation.resolve_checkpoint_type(str(lora), "full")
+        with self.assertRaisesRegex(ValueError, "declared LoRA checkpoint"):
+            evaluation.resolve_checkpoint_type(str(full), "lora")
 
     def test_direct_benchmark_overrides_manifest_count(self):
         plan = evaluation.build_plan(self.args("--benchmark", f"mmlu_pro={self.root / 'data.parquet'}"))
@@ -232,15 +258,23 @@ class SavedStudentIntegrationTests(unittest.TestCase):
                                     LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj"], task_type="CAUSAL_LM"))
             trained.save_pretrained(adapter)
             tokenizer.save_pretrained(adapter)
-            loaded, wrapped = evaluation.load_model_assets(str(adapter), dtype=torch.float32,
-                                                           device="cpu", thinking=False)
+            with self.assertRaisesRegex(ValueError, "declared full-model checkpoint"):
+                evaluation.load_model_assets(str(adapter), dtype=torch.float32, device="cpu",
+                                             thinking=False, checkpoint_type="full")
+            with self.assertRaisesRegex(ValueError, "declared LoRA checkpoint"):
+                evaluation.load_model_assets(str(base), dtype=torch.float32, device="cpu",
+                                             thinking=False, checkpoint_type="lora")
+            loaded, wrapped = evaluation.load_model_assets(
+                str(adapter), dtype=torch.float32, device="cpu", thinking=False,
+                checkpoint_type="lora")
             self.assertIsInstance(loaded, PeftModel)
             self.assertFalse(loaded.training)
             self.assertNotIn("<think>", wrapped.apply_chat_template(
                 [{"role": "user", "content": "question"}], tokenize=False, add_generation_prompt=True))
             self.assertEqual(loaded.generation_config.repetition_penalty, 1.0)
-            plain, thinking_tokenizer = evaluation.load_model_assets(str(base), dtype=torch.float32,
-                                                                     device="cpu", thinking=True)
+            plain, thinking_tokenizer = evaluation.load_model_assets(
+                str(base), dtype=torch.float32, device="cpu", thinking=True,
+                checkpoint_type="full")
             self.assertNotIsInstance(plain, PeftModel)
             self.assertIn("<think>", thinking_tokenizer.apply_chat_template(
                 [{"role": "user", "content": "question"}], tokenize=False, add_generation_prompt=True))
@@ -250,7 +284,7 @@ class SavedStudentIntegrationTests(unittest.TestCase):
                  "reward_model": {"ground_truth": "__CHOICE__A"}}
                 for text in ("question", "long long question", "long question")]), data)
             args = evaluation.argument_parser().parse_args([
-                "--benchmark", f"mmlu_pro={data}", "--checkpoint", f"ren={adapter}",
+                "--benchmark", f"mmlu_pro={data}", "--lora-checkpoint", f"ren={adapter}",
                 "--gpus", "cpu", "--batch-size", "2", "--max-response-tokens", "2",
                 "--max-prompt-tokens", "32", "--dtype", "float32", "--no-thinking",
                 "--output-dir", str(root / "out")])
@@ -277,7 +311,7 @@ class SavedStudentIntegrationTests(unittest.TestCase):
             # with no inherited project PYTHONPATH and only relative user paths.
             completed = subprocess.run([
                 sys.executable, str(SCRIPT), "--benchmark", "mmlu_pro=mmlu.parquet",
-                "--checkpoint", "ren=adapter", "--include-base", "--model", "base",
+                "--lora-checkpoint", "ren=adapter", "--include-base", "--model", "base",
                 "--gpus", "cpu", "--batch-size", "2", "--max-response-tokens", "2",
                 "--max-prompt-tokens", "32", "--dtype", "float32", "--no-thinking",
                 "--output-dir", "suite"], cwd=root, env={**os.environ, "PYTHONPATH": ""},

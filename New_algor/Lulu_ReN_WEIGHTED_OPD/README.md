@@ -63,7 +63,7 @@ Frozen causal hidden states 留在各 Student 进程内存中。默认 `ren_opd`
 
 当前 Torch 2.7 / Transformers 4.52.4 下，Teacher TP 的 rowwise 输出归约显式同步完成；矩阵仍按原生 TP plan 分片。此前较大 GPU batch 出现过 collective 超时，已应用该规避方案，并通过 CPU 双进程 8192-token 投影对照检查；该修复尚未重做大型 GPU 验证。
 
-默认 LoRA rank16、dropout0；`--lora-rank 0` 支持全参数更新。Student/Teacher 必须有相同 tokenizer token→ID 映射和 output vocabulary size，不相容时明确报错。
+默认 `--lora-rank 0`，对 Student 全部参数更新；传入正数才启用 LoRA。Student/Teacher 必须有相同 tokenizer token→ID 映射和 output vocabulary size，不相容时明确报错。
 
 需要复现旧实验、查看磁盘缓存或复用同一轮轨迹多次更新时，使用 `--backend staged`。该后端仍是 collect → Teacher → update 子进程阶段，每轮重新加载模型，Teacher 使用 HF 层分片；`--teacher-workers`、`--teacher-memory-gib` 和 `--keep-round-cache` 用于此模式。常驻后端不接受 `--keep-round-cache`。
 
@@ -113,7 +113,7 @@ export OMP_NUM_THREADS=1
 
 去掉 `--dry-run` 开始训练；同命令加 `--resume` 恢复。恢复要求模型、训练配置和 train.jsonl 的 SHA256 一致；输入/输出路径的写法以及保存间隔可调整，原始 run_config.json 不会被重写。常驻后端从原子发布的 `checkpoints/latest` 恢复完整 Student 和 optimizer；历史 staged 实验应显式使用 `--backend staged` 续训，不能直接切换后端复用其运行目录。
 
-`--save-every 20` 默认保留初始化、每 20 次 optimizer update 的节点、最终节点和最新版本。**latest 仍在每次更新后写入**；减少的是历史文件数量，不代表磁盘写入频率降低 20 倍。保存成功后才切换 latest 并清理旧的非保留节点，失败不会损坏此前 latest。默认 LoRA 的保存量较小，全参数更新的 checkpoint I/O 会明显增加。
+`--save-every 20` 默认保留初始化、每 20 次 optimizer update 的节点、最终节点和最新版本。**latest 仍在每次更新后写入**；减少的是历史文件数量，不代表磁盘写入频率降低 20 倍。保存成功后才切换 latest 并清理旧的非保留节点，失败不会损坏此前 latest。默认全参数更新的 checkpoint I/O 与磁盘占用明显高于 LoRA。
 
 Qwen3-32B 未在本机已检查的 cache 中，需要先提供其本地路径／缓存，或取消离线模式使 HF 正常下载。可显式换 `--teacher-model Qwen/Qwen3-14B` 使用已缓存模型；不会静默替换 Teacher。32B 的完整训练耗时尚未实测。
 

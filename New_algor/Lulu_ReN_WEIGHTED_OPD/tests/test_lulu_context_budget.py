@@ -11,6 +11,7 @@ def test_default_8192_response_budget_and_conservative_batches():
     assert args.max_new_tokens == 8192
     assert args.max_prompt_tokens == 4096
     assert args.max_sequence_tokens == 16384
+    assert args.lora_rank == 0
     assert (args.rollout_batch_size, args.score_batch_size, args.train_micro_batch_size) == (4, 1, 1)
     assert args.save_every == 20
     args.max_sequence_tokens = 8192

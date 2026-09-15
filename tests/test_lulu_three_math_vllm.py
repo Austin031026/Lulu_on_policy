@@ -53,6 +53,22 @@ class ThreeMathVllmTests(unittest.TestCase):
             weights.write_bytes(b"second")
             self.assertNotEqual(first, evaluation.checkpoint_digest(root))
 
+    def test_explicit_checkpoint_types_are_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            full = root / "full"
+            lora = root / "lora"
+            merged = root / "merged"
+            full.mkdir(); lora.mkdir(); merged.mkdir()
+            (full / "config.json").write_text("{}")
+            (lora / "adapter_config.json").write_text("{}")
+            (lora / "adapter_model.safetensors").write_bytes(b"weights")
+            self.assertEqual(evaluation.resolve_model(full, merged, checkpoint_type="full"), full)
+            with self.assertRaisesRegex(ValueError, "declared full-model checkpoint"):
+                evaluation.resolve_model(lora, merged, checkpoint_type="full")
+            with self.assertRaisesRegex(ValueError, "declared LoRA checkpoint"):
+                evaluation.resolve_model(full, merged, checkpoint_type="lora")
+
     def test_progress_snapshot_counts_rollout_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

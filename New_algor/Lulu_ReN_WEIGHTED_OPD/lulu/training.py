@@ -68,7 +68,8 @@ def parser():
     p.add_argument('--learning-rate', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=0.0)
     p.add_argument('--max-grad-norm', type=float, default=1.0)
-    p.add_argument('--lora-rank', type=int, default=16, help='0 for full parameter training')
+    p.add_argument('--lora-rank', type=int, default=0,
+                   help='LoRA rank; 0 (default) trains all Student parameters')
     p.add_argument('--lora-alpha', type=int, default=32)
     p.add_argument('--lora-target-modules', default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj')
     p.add_argument('--dtype', choices=('bfloat16', 'float32'), default='bfloat16')

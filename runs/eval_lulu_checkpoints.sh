@@ -17,7 +17,13 @@ SORAKA_ROOT="${LULU_SORAKA_ROOT:-$ROOT_DIR}"
 MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
 STEPS="${STEPS:-20,40,60,80,100}"
 BENCHMARKS="${BENCHMARKS:-aime25,olympiadbench}"
+CHECKPOINT_TYPE="${CHECKPOINT_TYPE:-full}"
 OUTPUT_DIR="${OUTPUT_DIR:-$TRAIN_OUTPUT_DIR/evaluation/checkpoints_${STEPS//,/_}}"
+if [[ "$CHECKPOINT_TYPE" != full && "$CHECKPOINT_TYPE" != lora ]]; then
+  echo "CHECKPOINT_TYPE must be full or lora: $CHECKPOINT_TYPE" >&2
+  exit 2
+fi
+checkpoint_option="--${CHECKPOINT_TYPE}-checkpoint"
 
 args=(--model "$MODEL" --include-base
       --soraka-root "$SORAKA_ROOT"
@@ -44,7 +50,16 @@ for raw_step in "${step_values[@]}"; do
     echo "Missing retained checkpoint: $checkpoint" >&2
     exit 2
   fi
-  args+=(--checkpoint "step_$step=$checkpoint")
+  if [[ "$CHECKPOINT_TYPE" == full ]]; then
+    [[ -f "$checkpoint/config.json" && ! -f "$checkpoint/adapter_config.json" ]] || {
+      echo "Expected a full-model checkpoint with config.json: $checkpoint" >&2; exit 2;
+    }
+  else
+    [[ -f "$checkpoint/adapter_config.json" && ( -f "$checkpoint/adapter_model.safetensors" || -f "$checkpoint/adapter_model.bin" ) ]] || {
+      echo "Expected a complete LoRA adapter checkpoint: $checkpoint" >&2; exit 2;
+    }
+  fi
+  args+=("$checkpoint_option" "step_$step=$checkpoint")
 done
 
 [[ "${THINKING:-1}" != 0 ]] || args+=(--no-thinking)

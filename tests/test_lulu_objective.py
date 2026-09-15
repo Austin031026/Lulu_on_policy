@@ -3,9 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from lulu.objective import (build_cached_target, build_target, forward_kl,
+from lulu.objective import (build_cached_target, build_target, directional_kl,
+                            forward_kl, pointwise_kl_statistics,
                             probability_mass_at_ids, recognition_weighted_forward_kl,
-                            reduce_position_losses)
+                            reduce_position_losses, reverse_kl)
 
 
 def _probabilities():
@@ -226,6 +227,62 @@ def test_pointwise_kl_clip_caps_vocab_contributions_before_sum():
     actual = forward_kl(student, target, pointwise_clip=0.05)
     torch.testing.assert_close(actual, expected)
     assert actual < unclipped_terms.sum()
+
+
+def test_reverse_kl_and_pointwise_clip_are_exact_and_stop_target_gradient():
+    target = torch.tensor([[0.8, 0.2]], dtype=torch.float64, requires_grad=True)
+    student_probs = torch.tensor([[0.01, 0.99]], dtype=torch.float64)
+    student = student_probs.log().requires_grad_()
+    terms = student_probs * (student_probs.log() - target.detach().log())
+
+    actual = reverse_kl(student, target)
+    clipped = reverse_kl(student, target, pointwise_clip=0.05)
+    torch.testing.assert_close(actual, terms.sum(-1).mean())
+    torch.testing.assert_close(clipped, terms.clamp(max=0.05).sum(-1).mean())
+    torch.testing.assert_close(
+        directional_kl(student, target, direction="reverse"), actual)
+
+    clipped.backward()
+    assert student.grad is not None and torch.isfinite(student.grad).all()
+    assert target.grad is None
+
+
+def test_reverse_kl_floors_underflowed_dense_target_without_nonfinite_loss():
+    target = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    student = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    loss = reverse_kl(student, target)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(student.grad).all()
+
+
+def test_pointwise_statistics_report_exact_threshold_tail_for_both_directions():
+    target = torch.tensor([[0.8, 0.2]], dtype=torch.float64)
+    student_probs = torch.tensor([[0.01, 0.99]], dtype=torch.float64)
+    logits = student_probs.log()
+    thresholds = [0.01, 0.05]
+    sums, maxima = pointwise_kl_statistics(
+        logits, target, thresholds, pointwise_clip=0.05)
+
+    expected = [
+        target * (target.log() - student_probs.log()),
+        student_probs * (student_probs.log() - target.log()),
+    ]
+    assert sums.shape == (2, 14)
+    for index, contributions in enumerate(expected):
+        assert sums[index, 0].item() == 1
+        assert sums[index, 1].item() == 2
+        torch.testing.assert_close(sums[index, 2], contributions.sum())
+        torch.testing.assert_close(sums[index, 3], contributions.clamp(max=0.05).sum())
+        torch.testing.assert_close(sums[index, 4], contributions.clamp_min(0).sum())
+        torch.testing.assert_close(sums[index, 5], contributions.clamp_max(0).sum())
+        torch.testing.assert_close(maxima[index], contributions.max())
+        for threshold_index, threshold in enumerate(thresholds):
+            offset = 8 + 3 * threshold_index
+            assert sums[index, offset].item() == (contributions > threshold).sum().item()
+            assert sums[index, offset + 1].item() == (contributions > threshold).any(-1).sum().item()
+            torch.testing.assert_close(
+                sums[index, offset + 2], (contributions - threshold).clamp_min(0).sum())
 
 
 @pytest.mark.parametrize("value", [0, -0.1, True])

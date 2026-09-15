@@ -70,10 +70,24 @@ def build_plan(args):
     if args.lcb_processes <= 0:
         raise ValueError("lcb-processes must be positive")
     models = []
-    if not args.checkpoint or args.include_base:
-        models.append({"name": "base", "model": resolve_model_reference(args.model)})
-    models.extend({"name": name, "model": resolve_model_reference(path)}
-                  for name, path in map(named_value, args.checkpoint))
+    checkpoint_groups = (
+        ("full", args.full_checkpoint),
+        ("lora", args.lora_checkpoint),
+        ("auto", args.checkpoint),
+    )
+    has_checkpoint = any(values for _, values in checkpoint_groups)
+    if not has_checkpoint or args.include_base:
+        models.append({"name": "base", "model": resolve_model_reference(args.model),
+                       "checkpoint_type": "full"})
+    for checkpoint_type, values in checkpoint_groups:
+        for name, raw_path in map(named_value, values):
+            model_path = resolve_model_reference(raw_path)
+            if checkpoint_type != "auto":
+                if not Path(model_path).is_dir():
+                    raise FileNotFoundError(f"{checkpoint_type} checkpoint directory: {model_path}")
+                resolve_checkpoint_type(model_path, checkpoint_type)
+            models.append({"name": name, "model": model_path,
+                           "checkpoint_type": checkpoint_type})
     if len({x["name"] for x in models}) != len(models):
         raise ValueError("checkpoint names must be unique; base is reserved when evaluating the base")
     source = {}
@@ -147,14 +161,38 @@ def build_plan(args):
     }
 
 
-def load_model_assets(model_id, *, dtype, device, thinking, trust_remote_code=False, adapter_base_model=None):
-    """Load a full HF student or an ordinary PEFT student adapter exactly once."""
+def resolve_checkpoint_type(model_id, checkpoint_type="auto"):
+    """Resolve and validate a local checkpoint without importing model libraries."""
+    if checkpoint_type not in {"auto", "full", "lora"}:
+        raise ValueError(f"unknown checkpoint type: {checkpoint_type}")
+    path = Path(model_id).expanduser()
+    is_local = path.exists()
+    has_adapter = (path / "adapter_config.json").is_file()
+    has_adapter_weights = any((path / name).is_file() for name in
+                              ("adapter_model.safetensors", "adapter_model.bin"))
+    has_full_config = (path / "config.json").is_file()
+    if checkpoint_type == "auto":
+        checkpoint_type = "lora" if has_adapter else "full"
+    if checkpoint_type == "lora":
+        if not has_adapter or not has_adapter_weights:
+            raise ValueError(f"declared LoRA checkpoint is incomplete: {path}")
+    elif is_local:
+        if has_adapter:
+            raise ValueError(f"declared full-model checkpoint contains adapter_config.json: {path}")
+        if not has_full_config:
+            raise ValueError(f"declared full-model checkpoint has no config.json: {path}")
+    return checkpoint_type
+
+
+def load_model_assets(model_id, *, dtype, device, thinking, trust_remote_code=False,
+                      adapter_base_model=None, checkpoint_type="auto"):
+    """Load one explicitly typed full HF model or PEFT LoRA adapter."""
+    checkpoint_type = resolve_checkpoint_type(model_id, checkpoint_type)
     from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
     path = Path(model_id).expanduser()
-    adapter = (path / "adapter_config.json").is_file()
     kwargs = dict(torch_dtype=dtype, trust_remote_code=trust_remote_code, low_cpu_mem_usage=True)
-    if adapter:
+    if checkpoint_type == "lora":
         from peft import PeftConfig, PeftModel
         config = PeftConfig.from_pretrained(str(path))
         base_id = adapter_base_model or config.base_model_name_or_path
@@ -209,6 +247,12 @@ def make_runner(plan, device):
     add_shared_framework_paths(plan)
     from evaluate_plain_model import PlainModelRunner
 
+    checkpoint_types = {}
+    for item in plan["models"]:
+        previous = checkpoint_types.setdefault(item["model"], item.get("checkpoint_type", "auto"))
+        if previous != item.get("checkpoint_type", "auto"):
+            raise ValueError(f"one model path has conflicting checkpoint types: {item['model']}")
+
     class LuluRunner(PlainModelRunner):
         def load_model(self, model_id, **kwargs):
             if self.model_id == model_id and self.model is not None:
@@ -218,6 +262,7 @@ def make_runner(plan, device):
                 model_id, dtype=self.dtype, device=device, thinking=plan["thinking"],
                 trust_remote_code=plan["trust_remote_code"],
                 adapter_base_model=plan["adapter_base_model"],
+                checkpoint_type=checkpoint_types.get(model_id, "auto"),
             )
             self.model_id = model_id
             print(f"[lulu-eval][READY] model={model_id} device={device}", flush=True)
@@ -399,9 +444,14 @@ def run_suite(plan):
 def argument_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-1.7B", help="base student identifier")
-    p.add_argument("--checkpoint", action="append", default=[], metavar="NAME=PATH", help="repeat for HF/PEFT checkpoints")
+    p.add_argument("--full-checkpoint", action="append", default=[], metavar="NAME=PATH",
+                   help="repeat for complete Hugging Face model checkpoints")
+    p.add_argument("--lora-checkpoint", action="append", default=[], metavar="NAME=PATH",
+                   help="repeat for PEFT LoRA adapter checkpoints")
+    p.add_argument("--checkpoint", action="append", default=[], metavar="NAME=PATH",
+                   help="legacy auto-detected HF/PEFT checkpoint; prefer an explicit typed option")
     p.add_argument("--include-base", action="store_true", help="also evaluate base and compute paired deltas")
-    p.add_argument("--adapter-base-model", help="override the base path stored in local PEFT adapters")
+    p.add_argument("--adapter-base-model", help="override the base path stored in LoRA adapters")
     p.add_argument("--data-manifest", help="existing prepare_crossbench_data.py manifest.json")
     p.add_argument("--benchmark", action="append", default=[], metavar="NAME=PARQUET")
     p.add_argument("--benchmarks", help="comma-separated manifest names; default five math/general benchmarks; 'all' includes coding")

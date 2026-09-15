@@ -13,9 +13,32 @@ def test_default_8192_response_budget_and_conservative_batches():
     assert args.max_sequence_tokens == 16384
     assert (args.rollout_batch_size, args.score_batch_size, args.train_micro_batch_size) == (4, 1, 1)
     assert args.save_every == 20
+    assert args.lora_rank == 0
+    assert args.kl_direction == 'forward'
+    assert args.kl_diagnostics is False
+    assert 0.05 in args.kl_diagnostic_thresholds
     args.max_sequence_tokens = 8192
     with pytest.raises(ValueError, match='max_prompt_tokens.*max_new_tokens'):
         training.validate_args(args)
+
+
+def test_reverse_kl_requires_an_explicit_target_and_enables_shadow_diagnostics():
+    args = training.parser().parse_args([
+        '--train-data', 'unused', '--output-dir', 'unused', '--kl-direction', 'reverse'])
+    training.validate_args(args)
+    assert training.kl_diagnostics_enabled(args)
+
+    args.method = 'ren_weighted_opd'
+    with pytest.raises(ValueError, match='reverse KL is not defined'):
+        training.validate_args(args)
+
+
+def test_pre_kl_direction_manifest_gets_forward_compatible_defaults():
+    old = {'backend': 'persistent', 'method': 'ren_opd'}
+    normalized = training.with_kl_defaults(old)
+    assert normalized['kl_direction'] == 'forward'
+    assert normalized['kl_diagnostics'] is False
+    assert normalized['kl_diagnostic_thresholds'] == training.DEFAULT_KL_DIAGNOSTIC_THRESHOLDS
 
 
 def test_last_reasoning_token_at_8192_response_limit_uses_exact_prefix():

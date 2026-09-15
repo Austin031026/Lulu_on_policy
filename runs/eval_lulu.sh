@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Example: DATA_MANIFEST=/path/manifest.json CHECKPOINT=/path/student bash runs/eval_lulu.sh
+# Example: DATA_MANIFEST=/path/manifest.json FULL_CHECKPOINT=/path/student bash runs/eval_lulu.sh
 set -euo pipefail
 RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$RUN_DIR/.." && pwd)"
@@ -17,7 +17,14 @@ args=(--model "$MODEL" --soraka-root "$SORAKA_ROOT"
 [[ -z "${DATA_MANIFEST:-}" ]] || args+=(--data-manifest "$DATA_MANIFEST")
 [[ -z "${EVAL_DATA:-}" ]] || args+=(--benchmark "${BENCHMARK_NAME:-custom}=$EVAL_DATA")
 [[ -z "${BENCHMARKS:-}" ]] || args+=(--benchmarks "$BENCHMARKS")
-[[ -z "${CHECKPOINT:-}" ]] || args+=(--checkpoint "${CHECKPOINT_NAME:-lulu}=$CHECKPOINT")
+checkpoint_sources=0
+[[ -z "${FULL_CHECKPOINT:-}" ]] || { args+=(--full-checkpoint "${CHECKPOINT_NAME:-lulu}=$FULL_CHECKPOINT"); ((checkpoint_sources+=1)); }
+[[ -z "${LORA_CHECKPOINT:-}" ]] || { args+=(--lora-checkpoint "${CHECKPOINT_NAME:-lulu}=$LORA_CHECKPOINT"); ((checkpoint_sources+=1)); }
+[[ -z "${CHECKPOINT:-}" ]] || { args+=(--checkpoint "${CHECKPOINT_NAME:-lulu}=$CHECKPOINT"); ((checkpoint_sources+=1)); }
+if (( checkpoint_sources > 1 )); then
+  echo "Set only one of FULL_CHECKPOINT, LORA_CHECKPOINT, or legacy CHECKPOINT." >&2
+  exit 2
+fi
 [[ "${INCLUDE_BASE:-1}" != 1 ]] || args+=(--include-base)
 [[ "${THINKING:-1}" != 0 ]] || args+=(--no-thinking)
 [[ "${STORE_TEXT:-0}" != 1 ]] || args+=(--store-text)

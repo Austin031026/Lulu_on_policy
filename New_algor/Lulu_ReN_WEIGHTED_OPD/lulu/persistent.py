@@ -526,8 +526,11 @@ def run_persistent(a):
     if a.keep_round_cache:
         raise ValueError('Persistent backend uses RAM caches; --keep-round-cache requires --backend staged')
     roles = allocate_roles(a)
+    training_mode = 'lora' if a.lora_rank else 'full_parameter'
+    checkpoint_format = 'peft_adapter' if a.lora_rank else 'huggingface_full_model'
     plan = {'backend': 'persistent', 'model': a.model, 'teacher': a.teacher_model,
-            'method': a.method, 'roles': roles,
+            'method': a.method, 'training_mode': training_mode,
+            'checkpoint_format': checkpoint_format, 'lora_rank': a.lora_rank, 'roles': roles,
             'teacher_parallelism': ('tensor_parallel' if roles['teacher'] and len(roles['teacher']) > 1
                                     else 'single_process' if roles['teacher'] is not None else None),
             'rollouts_per_round': a.global_batch_prompts*a.rollouts_per_prompt,
