@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from lulu import training
-from lulu.objective import (build_target, directional_kl, forward_kl, probability_mass_at_ids,
+from lulu.objective import (build_target, forward_kl, probability_mass_at_ids,
                             recognition_weighted_forward_kl)
 
 
@@ -38,11 +38,9 @@ def _student(lora=False):
     return model
 
 
-def _args(method='ren_opd', chunk_size=2, checkpointing=True, **overrides):
-    args = SimpleNamespace(method=method, max_sequence_tokens=128,
+def _args(method='ren_opd', chunk_size=2, checkpointing=True):
+    return SimpleNamespace(method=method, max_sequence_tokens=128,
         logit_chunk_size=chunk_size, gradient_checkpointing=checkpointing)
-    vars(args).update(overrides)
-    return args
 
 
 def _records(snapshot, method, *, include_empty=False):
@@ -85,8 +83,7 @@ def _records(snapshot, method, *, include_empty=False):
     return records, frozen_head, teacher_head, tok
 
 
-def _dense_loss(student, records, frozen_head, teacher_head, tok, method,
-                direction='forward', pointwise_clip=None):
+def _dense_loss(student, records, frozen_head, teacher_head, tok, method):
     hidden = training.selected_hidden(student, tok, records, 'causal_prompt_ids', _args())
     head = training.base_model(student).get_output_embeddings()
     total = hidden[0].sum() * 0.
@@ -103,8 +100,7 @@ def _dense_loss(student, records, frozen_head, teacher_head, tok, method,
         else:
             target = build_target(causal_logits, frozen_head(r['hindsight_hidden']),
                                   teacher_logits, 3, method)
-            total = total + directional_kl(
-                head(live), target, direction=direction, pointwise_clip=pointwise_clip)
+            total = total + forward_kl(head(live), target)
     return total
 
 
@@ -152,34 +148,6 @@ def test_real_peft_qwen3_checkpointed_chunk_gradients_and_bounded_vocab_saves():
         if n in grads:
             torch.testing.assert_close(p.grad, grads[n], atol=3e-6, rtol=3e-4)
     assert not any(len(shape) == 2 and shape[-1] == 31 for shape in shapes)
-
-
-@pytest.mark.parametrize('checkpointing', [False, True])
-def test_reverse_chunked_loss_keeps_forward_shadow_and_pointwise_tail_statistics(checkpointing):
-    snapshot = _student().eval().requires_grad_(False)
-    records, frozen_head, teacher_head, tok = _records(snapshot, 'ren_opd')
-    live = copy.deepcopy(snapshot).train().requires_grad_(True)
-    with torch.no_grad():
-        live.model.layers[0].self_attn.q_proj.weight.add_(.015)
-    expected = _dense_loss(
-        live, records, frozen_head, teacher_head, tok, 'ren_opd', 'reverse', 0.05)
-    expected.backward()
-    gradients = {name: p.grad.clone() for name, p in live.named_parameters() if p.grad is not None}
-    live.zero_grad(set_to_none=True)
-    if checkpointing:
-        live.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-    args = _args('ren_opd', 2, checkpointing, kl_direction='reverse', kl_diagnostics=True,
-                 kl_diagnostic_thresholds=[0.01, 0.05], pointwise_kl_clip=0.05)
-    actual, sums, maxima, sequence_sums = training.DistillationStep(
-        live, frozen_head, teacher_head, tok, args)(records)
-    actual.backward()
-    torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-5)
-    for name, parameter in live.named_parameters():
-        torch.testing.assert_close(parameter.grad, gradients[name], atol=3e-6, rtol=3e-4)
-    assert sums.shape == (2, 14)
-    assert maxima.shape == (2,)
-    assert sequence_sums.shape == (2,)
-    assert torch.isfinite(sums).all() and torch.isfinite(maxima).all()
 
 
 def _save_tokenizer(path):

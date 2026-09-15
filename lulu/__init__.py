@@ -8,13 +8,10 @@ from importlib import import_module
 __all__ = [
     'build_cached_target',
     'build_target',
-    'directional_kl',
     'forward_kl',
-    'pointwise_kl_statistics',
     'probability_mass_at_ids',
     'recognition_weighted_forward_kl',
     'reduce_position_losses',
-    'reverse_kl',
 ]
 
 
